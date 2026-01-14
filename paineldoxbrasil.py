@@ -10,7 +10,7 @@ import time
 # CONFIGURAÇÕES GERAIS E URLS
 # ==============================================================================
 st.set_page_config(
-    page_title="Painel do Vendedor Dox",
+    page_title="Painel Dox",
     page_icon="logodox.png",
     layout="wide"
 )
@@ -844,7 +844,7 @@ if not st.session_state['logado']:
                 else: st.warning("Preencha tudo.")
             if c2.form_submit_button("Voltar", use_container_width=True): st.session_state['fazendo_cadastro'] = False; st.rerun()
     else:
-        st.title("🔒 Login - Painel do Vendedor - Dox Brasil")
+        st.title("🔒 Login - Painel Dox")
         c1, c2, c3 = st.columns([1, 1, 2])
         with c1:
             u = st.text_input("Login").strip()
