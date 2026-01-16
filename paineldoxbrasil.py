@@ -642,11 +642,11 @@ def exibir_aba_credito():
         
         **DATA_VENC_LC**: Data em que o limite de crédito do cliente vence.
         
-        **DISPONÍVEL VIA LC2**: Valor disponível para faturar usando o limite de crédito DOX, já considerando títulos em aberto.
+        **DISPONIVEL VIA LC2**: Valor disponível para faturar usando o limite de crédito DOX, já considerando títulos em aberto.
         
-        **DISPONÍVEL BV**: Valor disponível para faturar usando a modalidade BV (Banco/Vendor).
+        **DISPONIVEL BV**: Valor disponível para faturar usando a modalidade BV (Banco/Vendor).
         
-        **DISPONÍVEL VIA RA**: Valor disponível para faturar via RA (recebimento antecipado), desde que não existam atrasos.
+        **DISPONIVEL VIA RA**: Valor disponível para faturar via RA (recebimento antecipado), desde que não existam atrasos.
         
         **SALDO_A_VENCER**: Valor total de títulos que ainda vão vencer no futuro (não estão atrasados).
         
@@ -720,8 +720,8 @@ def exibir_aba_credito():
     cols_existentes = [c for c in cols_order if c in df_base.columns]
     df_base = df_base[cols_existentes].copy()
 
-    # --- INSERÇÃO DA COLUNA ISCA (AJUSTADA V62) ---
-    # Inserimos a coluna "DETALHES" na posição 0 com a seta
+    # --- INSERÇÃO DA COLUNA ISCA (AJUSTADA V63) ---
+    # Inserimos a coluna "DETALHES" na posição 0 com a seta e ajuste de largura
     df_base.insert(0, "DETALHES", "👈 VER TÍTULOS")
 
     # --- CONTROLE DE VISIBILIDADE DAS COLUNAS ---
@@ -759,9 +759,9 @@ def exibir_aba_credito():
     else:
         df_prioridade = pd.DataFrame()
 
-    # Configuração das Colunas (V62 - DETALHES AJUSTADO)
+    # Configuração das Colunas (V63 - WIDTH=130)
     config_colunas = {
-        "DETALHES": st.column_config.TextColumn("", help="Clique na caixa de seleção à esquerda para ver os títulos.", width="130"),
+        "DETALHES": st.column_config.TextColumn("", help="Clique na caixa de seleção à esquerda para ver os títulos.", width=130),
         "CLIENTE": st.column_config.TextColumn("Cliente", help="Nome do cliente."),
         "CNPJ": st.column_config.TextColumn("CNPJ", help="CNPJ."),
         "VENDEDOR": st.column_config.TextColumn("Vendedor", help="Vendedor."),
@@ -827,8 +827,10 @@ def exibir_aba_credito():
 
 
 def exibir_aba_fotos(is_admin=False):
+    st.info("ℹ️ Somente materiais da filial de Pinheiral.") 
     st.subheader("📷 Solicitação de Fotos (Material em RDQ)")
-    st.markdown("Digite o número do Lote/Bobina abaixo para solicitar fotos de materiais defeituosos.")
+    # MUDANÇA: Texto atualizado
+    st.markdown("Digite o número do Lote/Bobina abaixo para solicitar fotos de materiais no armazém 20/24.")
     with st.form("form_foto"):
         col_f1, col_f2 = st.columns([1, 2])
         with col_f1: lote_input = st.text_input("Lote / Bobina:")
@@ -847,6 +849,8 @@ def exibir_aba_fotos(is_admin=False):
         else: st.info("Nenhum pedido de foto registrado.")
 
 def exibir_aba_certificados(is_admin=False):
+    # MUDANÇA: Aviso adicionado
+    st.info("ℹ️ Somente bobinas nacionas. Materiais de SFS solicitar diretamente com o Faturamento/Logística da unidade.") 
     st.subheader("📑 Solicitação de Certificados de Qualidade")
     st.markdown("Digite o número do Lote/Bobina para receber o certificado de qualidade.")
     with st.form("form_certificado"):
@@ -958,29 +962,32 @@ else:
         if st.button("🔄 Atualizar Dados"): st.cache_data.clear(); st.rerun()
 
     if st.session_state['usuario_tipo'].lower() == "admin":
-        a1, a2, a3, a4, a5, a6, a7, a8 = st.tabs(["📂 Itens Programados", "💰 Crédito", "📝 Acessos", "📑 Certificados", "🧾 Notas Fiscais", "🔍 Logs", "📊 Faturamento", "🏭 Produção"])
+        a1, a2, a3, a4, a5, a6, a7, a8, a9 = st.tabs(["📂 Itens Programados", "💰 Crédito", "📷 Fotos RDQ", "📝 Acessos", "📑 Certificados", "🧾 Notas Fiscais", "🔍 Logs", "📊 Faturamento", "🏭 Produção"])
         with a1: exibir_carteira_pedidos()
         with a2: exibir_aba_credito()
-        with a3: st.dataframe(carregar_solicitacoes(), use_container_width=True)
-        with a4: exibir_aba_certificados(True)
-        with a5: exibir_aba_notas(True) 
-        with a6: st.dataframe(carregar_logs_acessos(), use_container_width=True)
-        with a7: exibir_aba_faturamento()
-        with a8: exibir_aba_producao()
+        with a3: exibir_aba_fotos(True) # ADMIN COM ACESSO TOTAL
+        with a4: st.dataframe(carregar_solicitacoes(), use_container_width=True)
+        with a5: exibir_aba_certificados(True)
+        with a6: exibir_aba_notas(True) 
+        with a7: st.dataframe(carregar_logs_acessos(), use_container_width=True)
+        with a8: exibir_aba_faturamento()
+        with a9: exibir_aba_producao()
         
     elif st.session_state['usuario_tipo'].lower() == "master":
-        a1, a2, a3, a4, a5, a6 = st.tabs(["📂 Itens Programados", "💰 Crédito", "📑 Certificados", "🧾 Notas Fiscais", "📊 Faturamento", "🏭 Produção"])
+        a1, a2, a3, a4, a5, a6, a7 = st.tabs(["📂 Itens Programados", "💰 Crédito", "📷 Fotos RDQ", "📑 Certificados", "🧾 Notas Fiscais", "📊 Faturamento", "🏭 Produção"])
         with a1: exibir_carteira_pedidos()
         with a2: exibir_aba_credito()
-        with a3: exibir_aba_certificados(False) 
-        with a4: exibir_aba_notas(False)        
-        with a5: exibir_aba_faturamento()
-        with a6: exibir_aba_producao()
+        with a3: exibir_aba_fotos(False) # VISÃO NORMAL
+        with a4: exibir_aba_certificados(False) 
+        with a5: exibir_aba_notas(False)        
+        with a6: exibir_aba_faturamento()
+        with a7: exibir_aba_producao()
         
     else:
-        # Vendedores e Gerentes Padrão
-        a1, a2, a3, a4 = st.tabs(["📂 Itens Programados", "💰 Crédito", "📑 Certificados", "🧾 Notas Fiscais"])
+        # Vendedores e Gerentes Padrão - ABA FOTOS ADICIONADA
+        a1, a2, a3, a4, a5 = st.tabs(["📂 Itens Programados", "💰 Crédito", "📷 Fotos RDQ", "📑 Certificados", "🧾 Notas Fiscais"])
         with a1: exibir_carteira_pedidos()
         with a2: exibir_aba_credito()
-        with a3: exibir_aba_certificados(False)
-        with a4: exibir_aba_notas(False)
+        with a3: exibir_aba_fotos(False) # VISÃO NORMAL
+        with a4: exibir_aba_certificados(False)
+        with a5: exibir_aba_notas(False)
