@@ -6,6 +6,7 @@ from datetime import datetime, timedelta
 import pytz
 import altair as alt
 import time
+from st_aggrid import AgGrid, GridOptionsBuilder, GridUpdateMode, DataReturnMode
 
 # ==============================================================================
 # CONFIGURAÇÕES GERAIS E URLS
@@ -83,29 +84,31 @@ def escrever_no_sheets(url, aba, df_novo, modo="append"):
         return False
 
 # ==============================================================================
-# FUNÇÃO DE CORREÇÃO NÚMERICA (CORREÇÃO DO ERRO 165 MILHÕES)
+# FUNÇÕES DE FORMATAÇÃO E CORREÇÃO
 # ==============================================================================
 
 def converte_numero_seguro(valor):
-    """
-    Converte string para float detectando se é formato BR (vírgula) ou US (ponto).
-    Evita o erro de transformar 479.2 em 4792.
-    """
+    """Converte string para float detectando se é formato BR ou US."""
     s = str(valor).strip()
     if not s or s.lower() == 'nan' or s.lower() == 'none': return 0.0
-    
-    # Se tem vírgula, assume que é formato BR (ex: 1.000,50 ou 10,5)
     if ',' in s:
-        s = s.replace('.', '') # Remove ponto de milhar
-        s = s.replace(',', '.') # Troca vírgula decimal por ponto
-    
-    # Se NÃO tem vírgula, mas tem ponto (ex: 479.2), assume formato US/Python
-    # Não fazemos replace nesse caso para não perder o decimal
-    
+        s = s.replace('.', '').replace(',', '.') 
     try:
         return float(s)
     except:
         return 0.0
+
+def formatar_br_decimal(valor, casas=3):
+    """
+    Formata um número float para o padrão brasileiro (1.000,000).
+    Entrada: 1234.56 -> Saída: '1.234,560'
+    """
+    try:
+        v = float(valor)
+        s = "{:,.{}f}".format(v, casas)
+        return s.replace(',', 'X').replace('.', ',').replace('X', '.')
+    except:
+        return str(valor)
 
 # ==============================================================================
 # CARREGAMENTO DE DADOS (COM CACHE)
@@ -113,7 +116,6 @@ def converte_numero_seguro(valor):
 
 @st.cache_data(ttl="30m", show_spinner=False)
 def carregar_usuarios():
-    # Login resiliente (10 tentativas)
     df_users = ler_com_retry(URL_SISTEMA, "Usuarios", tentativas=10, espera=2)
     if not df_users.empty: return df_users.astype(str)
     return pd.DataFrame()
@@ -124,7 +126,6 @@ def ler_dados_nuvem_generico(aba, url_planilha):
     if not df.empty:
         df.columns = df.columns.str.strip().str.upper()
         if 'TONS' in df.columns:
-            # Aplica a função segura
             df['TONS'] = df['TONS'].apply(converte_numero_seguro)
         if 'DATA_EMISSAO' in df.columns:
             df['DATA_DT'] = pd.to_datetime(df['DATA_EMISSAO'], dayfirst=True, errors='coerce')
@@ -140,10 +141,41 @@ def carregar_faturamento_vendedores():
     if not df.empty:
         df.columns = df.columns.str.strip().str.upper()
         if 'TONS' in df.columns:
-            # Aplica a função segura
             df['TONS'] = df['TONS'].apply(converte_numero_seguro)
         if 'DATA_EMISSAO' in df.columns:
             df['DATA_DT'] = pd.to_datetime(df['DATA_EMISSAO'], dayfirst=True, errors='coerce')
+        return df
+    return pd.DataFrame()
+
+# --- CARREGAMENTO E TRATAMENTO DO ESTOQUE ---
+@st.cache_data(ttl="10m", show_spinner=False)
+def carregar_estoque():
+    df = ler_com_retry(URL_SISTEMA, "Dados_Estoque")
+    if not df.empty:
+        df.columns = df.columns.str.strip().str.upper()
+        
+        # 1. Tratamento de Datas para cálculo de DIAS
+        if 'DIAS.ESTOQUE' in df.columns:
+            try:
+                df['DATA_ENTRADA'] = pd.to_datetime(df['DIAS.ESTOQUE'], dayfirst=True, errors='coerce')
+                agora = datetime.now()
+                df['DIAS'] = (agora - df['DATA_ENTRADA']).dt.days
+                df['DIAS'] = df['DIAS'].fillna(0).astype(int)
+            except:
+                df['DIAS'] = 0
+        else:
+            df['DIAS'] = 0
+
+        # 2. Tratamento Númerico Básico
+        cols_float = ['QTDE', 'EMPENHADO', 'DISPONIVEL', 'ESPES', 'LARGURA', 'COMPRIMENTO']
+        for col in cols_float:
+            if col in df.columns:
+                df[col] = df[col].apply(converte_numero_seguro)
+        
+        # 3. Regra da Espessura
+        if 'ESPES' in df.columns:
+            df['ESPES'] = df['ESPES'] / 100.0
+
         return df
     return pd.DataFrame()
 
@@ -543,6 +575,146 @@ def exibir_aba_producao():
     elif 'dados_producao' in st.session_state and st.session_state['dados_producao'].empty:
         st.warning("Nenhum dado na planilha de produção.")
     else: st.info("Clique no botão para carregar.")
+
+# --- NOVA ABA DE ESTOQUE (AG-GRID + FILTROS SIMPLIFICADOS) ---
+def exibir_aba_estoque():
+    st.subheader("📦 Consulta de Estoque Disponível")
+    
+    col_btn, _ = st.columns([1, 4])
+    with col_btn:
+        if st.button("🔄 Atualizar Estoque"):
+            carregar_estoque.clear()
+            st.rerun()
+            
+    df_estoque = carregar_estoque()
+    
+    if df_estoque.empty:
+        st.info("Nenhum dado de estoque carregado.")
+        return
+
+    # FILTROS
+    lista_filiais = ["Todas"] + sorted(df_estoque['FILIAL'].unique().tolist())
+    
+    c1, c2 = st.columns(2)
+    with c1:
+        filial_sel = st.selectbox("Filtrar por Filial:", lista_filiais)
+    with c2:
+        busca = st.text_input("Buscar (aperte enter após digitar):")
+
+    # CHECKBOX DE FILTRO DE DISPONIBILIDADE
+    # Título principal + Caption abaixo (para fonte menor)
+    somente_disp = st.checkbox("Somente Disponível")
+    st.caption("(marque para mostrar somente itens que possuem saldo disponível maior que zero)")
+
+    # APLICAÇÃO DOS FILTROS
+    df_filtrado = df_estoque.copy()
+    
+    # 1. Filtro de Saldo
+    if somente_disp:
+        if 'DISPONIVEL' in df_filtrado.columns:
+            df_filtrado = df_filtrado[df_filtrado['DISPONIVEL'] > 0.001]
+
+    # 2. Filtro de Filial
+    if filial_sel != "Todas":
+        df_filtrado = df_filtrado[df_filtrado['FILIAL'] == filial_sel]
+        
+    # 3. Filtro de Busca
+    if busca:
+        mask = df_filtrado.astype(str).apply(lambda x: x.str.contains(busca, case=False, na=False)).any(axis=1)
+        df_filtrado = df_filtrado[mask]
+
+    st.markdown(f"**Itens encontrados:** {len(df_filtrado)}")
+    
+    # ------------------------------------------------------------------
+    # PREPARAÇÃO PARA EXIBIÇÃO VISUAL (TEXTO FORMATADO)
+    # ------------------------------------------------------------------
+    
+    df_show = df_filtrado.copy()
+    
+    # 1. Renomeia Colunas
+    mapa_renomeacao = {
+        'PRODUTO': 'DESCRIÇÃO DO PRODUTO',
+        'ARMAZEM': 'ARM',
+        'LARGURA': 'LARG',
+        'COMPRIMENTO': 'COMP',
+        'EMPENHADO': 'EMP',
+        'DISPONIVEL': 'DISP'
+    }
+    df_show.rename(columns=mapa_renomeacao, inplace=True)
+
+    # 2. Formata Espessura
+    if 'ESPES' in df_show.columns:
+        df_show['ESPES'] = df_show['ESPES'].apply(lambda x: formatar_br_decimal(x, 2))
+
+    # 3. Formata Quantidades
+    cols_qtd = ['QTDE', 'EMP', 'DISP']
+    for col in cols_qtd:
+        if col in df_show.columns:
+            df_show[col] = df_show[col].apply(lambda x: formatar_br_decimal(x, 3))
+
+    # 4. Formata Comprimento
+    if 'COMP' in df_show.columns:
+        df_show['COMP'] = df_show['COMP'].apply(lambda x: str(int(x)) if x > 0 else "0")
+
+    # Seleção e Ordem das colunas
+    colunas_desejadas = [
+        "DIAS",
+        "FILIAL", 
+        "ARM", 
+        "DESCRIÇÃO DO PRODUTO", 
+        "LOTE", 
+        "ESPES", 
+        "LARG", 
+        "COMP", 
+        "QTDE",
+        "EMP",
+        "DISP"
+    ]
+    cols_finais = [c for c in colunas_desejadas if c in df_show.columns]
+    
+    # ------------------------------------------------------------------
+    # CONFIGURAÇÃO DA AG-GRID
+    # ------------------------------------------------------------------
+    
+    gb = GridOptionsBuilder.from_dataframe(df_show[cols_finais])
+    
+    # Configurações Globais
+    gb.configure_default_column(
+        resizable=True, 
+        filterable=True, 
+        sortable=True,
+        cellStyle={'textAlign': 'center'}
+    )
+    
+    # Configurações Específicas de Coluna (Larguras AJUSTADAS PARA EVITAR CORTES)
+    gb.configure_column("DESCRIÇÃO DO PRODUTO", minWidth=250, cellStyle={'textAlign': 'left'}) 
+    
+    # Aumentei os minWidth para garantir que os cabeçalhos apareçam (DIAS e LARG)
+    gb.configure_column("DIAS", minWidth=80, maxWidth=120) 
+    gb.configure_column("FILIAL", minWidth=120)
+    gb.configure_column("ARM", maxWidth=80)
+    gb.configure_column("LOTE", minWidth=110)
+    gb.configure_column("ESPES", maxWidth=90)
+    gb.configure_column("LARG", minWidth=90, maxWidth=120) # Aumentado para não cortar "LARG"
+    gb.configure_column("COMP", maxWidth=90)
+    gb.configure_column("QTDE", maxWidth=100)
+    gb.configure_column("EMP", maxWidth=100)
+    gb.configure_column("DISP", minWidth=100, cellStyle={'fontWeight': 'bold', 'textAlign': 'center', 'color': '#000080'})
+    
+    gb.configure_selection('single', use_checkbox=False)
+    gridOptions = gb.build()
+    
+    AgGrid(
+        df_show[cols_finais],
+        gridOptions=gridOptions,
+        height=500,
+        width='100%',
+        fit_columns_on_grid_load=True, 
+        theme='streamlit',
+        update_mode=GridUpdateMode.SELECTION_CHANGED,
+        allow_unsafe_jscode=True
+    )
+
 
 def exibir_carteira_pedidos():
     tipo_usuario = st.session_state['usuario_tipo'].lower()
@@ -1067,32 +1239,35 @@ else:
                 st.metric("Total (Tons)", f"{total_tons:,.2f}".replace(",", "X").replace(".", ",").replace("X", "."))
 
     if st.session_state['usuario_tipo'].lower() == "admin":
-        a1, a2, a3, a4, a5, a6, a7, a8, a9 = st.tabs(["📂 Itens Programados", "💰 Crédito", "📷 Fotos RDQ", "📝 Acessos", "📑 Certificados", "🧾 Notas Fiscais", "🔍 Logs", "📊 Faturamento", "🏭 Produção"])
+        a1, a2, a3, a4, a5, a6, a7, a8, a9, a10 = st.tabs(["📂 Itens Programados", "💰 Crédito", "📦 Estoque", "📷 Fotos RDQ", "📝 Acessos", "📑 Certificados", "🧾 Notas Fiscais", "🔍 Logs", "📊 Faturamento", "🏭 Produção"])
         with a1: exibir_carteira_pedidos()
         with a2: exibir_aba_credito()
-        with a3: exibir_aba_fotos(True) # ADMIN COM ACESSO TOTAL
-        with a4: st.dataframe(carregar_solicitacoes(), use_container_width=True)
-        with a5: exibir_aba_certificados(True)
-        with a6: exibir_aba_notas(True) 
-        with a7: st.dataframe(carregar_logs_acessos(), use_container_width=True)
-        with a8: exibir_aba_faturamento()
-        with a9: exibir_aba_producao()
+        with a3: exibir_aba_estoque() # <--- NOVA ABA
+        with a4: exibir_aba_fotos(True) # ADMIN COM ACESSO TOTAL
+        with a5: st.dataframe(carregar_solicitacoes(), use_container_width=True)
+        with a6: exibir_aba_certificados(True)
+        with a7: exibir_aba_notas(True) 
+        with a8: st.dataframe(carregar_logs_acessos(), use_container_width=True)
+        with a9: exibir_aba_faturamento()
+        with a10: exibir_aba_producao()
         
     elif st.session_state['usuario_tipo'].lower() == "master":
-        a1, a2, a3, a4, a5, a6, a7 = st.tabs(["📂 Itens Programados", "💰 Crédito", "📷 Fotos RDQ", "📑 Certificados", "🧾 Notas Fiscais", "📊 Faturamento", "🏭 Produção"])
+        a1, a2, a3, a4, a5, a6, a7, a8 = st.tabs(["📂 Itens Programados", "💰 Crédito", "📦 Estoque", "📷 Fotos RDQ", "📑 Certificados", "🧾 Notas Fiscais", "📊 Faturamento", "🏭 Produção"])
         with a1: exibir_carteira_pedidos()
         with a2: exibir_aba_credito()
-        with a3: exibir_aba_fotos(False) # VISÃO NORMAL
-        with a4: exibir_aba_certificados(False) 
-        with a5: exibir_aba_notas(False)        
-        with a6: exibir_aba_faturamento()
-        with a7: exibir_aba_producao()
+        with a3: exibir_aba_estoque() # <--- NOVA ABA
+        with a4: exibir_aba_fotos(False) # VISÃO NORMAL
+        with a5: exibir_aba_certificados(False) 
+        with a6: exibir_aba_notas(False)        
+        with a7: exibir_aba_faturamento()
+        with a8: exibir_aba_producao()
         
     else:
-        # Vendedores e Gerentes Padrão - ABA FOTOS ADICIONADA
-        a1, a2, a3, a4, a5 = st.tabs(["📂 Itens Programados", "💰 Crédito", "📷 Fotos RDQ", "📑 Certificados", "🧾 Notas Fiscais"])
+        # Vendedores e Gerentes Padrão - ABA ESTOQUE ADICIONADA
+        a1, a2, a3, a4, a5, a6 = st.tabs(["📂 Itens Programados", "💰 Crédito", "📦 Estoque", "📷 Fotos RDQ", "📑 Certificados", "🧾 Notas Fiscais"])
         with a1: exibir_carteira_pedidos()
         with a2: exibir_aba_credito()
-        with a3: exibir_aba_fotos(False) # VISÃO NORMAL
-        with a4: exibir_aba_certificados(False)
-        with a5: exibir_aba_notas(False)
+        with a3: exibir_aba_estoque() # <--- NOVA ABA
+        with a4: exibir_aba_fotos(False) # VISÃO NORMAL
+        with a5: exibir_aba_certificados(False)
+        with a6: exibir_aba_notas(False)
