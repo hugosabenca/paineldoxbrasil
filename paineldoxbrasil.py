@@ -1149,7 +1149,7 @@ def exibir_aba_fotos(is_admin=False):
     st.markdown("Digite o número do Lote exato abaixo para solicitar fotos de materiais no armazém 20/24.")
     with st.form("form_foto"):
         col_f1, col_f2 = st.columns([1, 2])
-        with col_f1: lote_input = st.text_input("Lote / Bobina:")
+        with col_f1: lote_input = st.text_input("Lote:")
         with col_f2: email_input = st.text_input("Enviar para o e-mail:", value=st.session_state.get('usuario_email', ''))
         if st.form_submit_button("Solicitar Fotos", type="primary"):
             if not lote_input: 
@@ -1177,7 +1177,7 @@ def exibir_aba_fotos(is_admin=False):
 def exibir_aba_certificados(is_admin=False):
     st.info("ℹ️ Somente bobinas nacionas. Materiais de SFS solicitar diretamente com o Faturamento/Logística da unidade.") 
     st.subheader("📑 Solicitação de Certificados de Qualidade")
-    st.markdown("Digite o número do Lote/Bobina para receber o certificado de qualidade.")
+    st.markdown("Digite o número do Lote exato para receber o certificado de qualidade.")
     with st.form("form_certificado"):
         col_c1, col_c2 = st.columns([1, 2])
         with col_c1: 
