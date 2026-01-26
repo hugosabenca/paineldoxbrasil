@@ -1146,7 +1146,7 @@ def exibir_aba_credito():
 def exibir_aba_fotos(is_admin=False):
     st.info("ℹ️ Somente materiais da filial de Pinheiral.") 
     st.subheader("📷 Solicitação de Fotos (Material em RDQ)")
-    st.markdown("Digite o número do Lote/Bobina abaixo para solicitar fotos de materiais no armazém 20/24.")
+    st.markdown("Digite o número do Lote exato abaixo para solicitar fotos de materiais no armazém 20/24.")
     with st.form("form_foto"):
         col_f1, col_f2 = st.columns([1, 2])
         with col_f1: lote_input = st.text_input("Lote / Bobina:")
@@ -1181,7 +1181,7 @@ def exibir_aba_certificados(is_admin=False):
     with st.form("form_certificado"):
         col_c1, col_c2 = st.columns([1, 2])
         with col_c1: 
-            lote_cert = st.text_input("Lote / Bobina (Certificado):")
+            lote_cert = st.text_input("Lote:")
             st.caption("ℹ️ Lotes que só alteram o sequencial final são provenientes da mesma matéria prima. Exemplo: 06818601001, 06818601002, 06818601003 representam a mesma bobina pai.")
         with col_c2: email_cert = st.text_input("Enviar para o e-mail:", value=st.session_state.get('usuario_email', ''), key="email_cert_input")
         if st.form_submit_button("Solicitar Certificado", type="primary"):
