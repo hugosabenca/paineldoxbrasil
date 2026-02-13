@@ -7,6 +7,9 @@ import pytz
 import altair as alt
 import time
 from st_aggrid import AgGrid, GridOptionsBuilder, GridUpdateMode, DataReturnMode
+from streamlit_extras.let_it_rain import rain
+import requests
+from streamlit_lottie import st_lottie
 
 # ==============================================================================
 # CONFIGURAÇÕES GERAIS E URLS
@@ -138,33 +141,6 @@ def obter_dados_persistentes(chave_sessao, funcao_carregamento):
 # FUNÇÕES DE FEEDBACK
 # ==============================================================================
 
-def ja_enviou_feedback(login):
-    # Usa retry padrão, mas retorna False se falhar para não travar
-    df = ler_com_retry(URL_SISTEMA, "Feedback_Vendedores", tentativas=3)
-    if df is None or df.empty:
-        return False
-    
-    if 'Login' in df.columns:
-        logins_existentes = df['Login'].astype(str).str.strip().str.lower().tolist()
-        return str(login).strip().lower() in logins_existentes
-    return False
-
-def salvar_feedback(login, nome, satisfacao, dispositivo, menos_usada, remover, sugestao):
-    try:
-        agora_br = datetime.now(FUSO_BR).strftime("%d/%m/%Y %H:%M:%S")
-        df_novo = pd.DataFrame([{
-            "Data": agora_br,
-            "Login": login,
-            "Nome": nome,
-            "Satisfacao": satisfacao,
-            "Dispositivo": dispositivo,
-            "Aba_Menos_Usada": menos_usada,
-            "Abas_Remover": remover,
-            "Sugestao": sugestao
-        }])
-        return escrever_no_sheets(URL_SISTEMA, "Feedback_Vendedores", df_novo, modo="append")
-    except:
-        return False
 
 # ==============================================================================
 # FUNÇÕES DE FORMATAÇÃO E CORREÇÃO
@@ -1259,81 +1235,83 @@ if not st.session_state['logado']:
                 else: st.warning("Preencha tudo.")
             if c2.form_submit_button("Voltar", use_container_width=True): st.session_state['fazendo_cadastro'] = False; st.rerun()
     else:
-        st.title("🔒 Login - Painel Dox")
-        c1, c2, c3 = st.columns([1, 1, 2])
-        with c1:
-            u = st.text_input("Login").strip()
-            s = st.text_input("Senha", type="password").strip()
-            if st.button("Acessar", type="primary"):
-                # Agora usa a função com cache e retry logic
-                df = carregar_usuarios()
-                
-                if df.empty:
-                    # Se mesmo com 5 tentativas falhar, aí sim mostra erro
-                    st.error("Falha temporária de conexão com o Banco de Dados. Por favor, tente novamente em alguns segundos.")
-                elif 'Login' not in df.columns or 'Senha' not in df.columns:
-                    st.error("Erro técnico na validação do login. Contate o suporte.")
-                else:
-                    try:
-                        user = df[(df['Login'].str.lower() == u.lower()) & (df['Senha'] == s)]
-                        if not user.empty:
-                            d = user.iloc[0]
-                            st.session_state.update({
-                                'logado': True, 
-                                'usuario_nome': d['Nome Vendedor'].split()[0], 
-                                'usuario_filtro': d['Nome Vendedor'], 
-                                'usuario_email': d.get('Email', ''), 
-                                'usuario_tipo': d['Tipo'],
-                                'usuario_login': d['Login'] # Salva o login para o feedback
-                            })
-                            registrar_acesso(u, d['Nome Vendedor'])
-                            st.rerun()
-                        else: st.error("Dados incorretos.")
-                    except Exception as e:
-                        st.error("Erro ao processar login. Tente novamente.")
-            st.markdown("---")
-            if st.button("Solicitar Acesso"): st.session_state['fazendo_cadastro'] = True; st.rerun()
-else:
-    # --- BLOCO DE FEEDBACK OBRIGATÓRIO (NOVO) ---
-    precisa_votar = False
-    
-    if st.session_state['usuario_tipo'].lower() == "vendedor":
-        # Verifica se já checamos nesta sessão para não ler o sheets toda hora
-        if 'feedback_enviado' not in st.session_state:
-             # Usa o login salvo na sessão
-             login_atual = st.session_state.get('usuario_login', st.session_state['usuario_filtro'])
-             st.session_state['feedback_enviado'] = ja_enviou_feedback(login_atual)
+        # =================================================================
+        # TELA DE LOGIN: SEM LINHA, ALINHADA À ESQUERDA E ESTREITA
+        # =================================================================
         
-        if not st.session_state['feedback_enviado']:
-            st.markdown("### 👋 Olá! Antes de prosseguir...")
-            st.info("Para continuarmos evoluindo o Painel Dox, precisamos da sua opinião rápida. É obrigatório, mas leva menos de 1 minuto.")
+        # 1. EFEITO CARNAVAL
+        try:
+            rain(emoji="🎭", font_size=50, falling_speed=6, animation_length="infinite")
+        except: pass
+
+        # 2. CARREGAR ANIMAÇÃO
+        def load_lottieurl(url):
+            try:
+                r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=5)
+                if r.status_code != 200: return None
+                return r.json()
+            except: return None
+
+        lottie_carnaval = load_lottieurl("https://assets5.lottiefiles.com/packages/lf20_u4yrau.json")
+
+        # 3. DIVISÃO DA TELA (ESQUERDA vs DIREITA)
+        col_esquerda, col_direita = st.columns([1.5, 1]) 
+
+        # --- LADO ESQUERDO ---
+        with col_esquerda:
+            st.title("🔒 Login - Painel Dox")
+            # (A linha divisória foi removida daqui)
             
-            with st.form("form_feedback"):
-                q1 = st.radio("O que tem achado do Painel?", ["Excelente", "Bom", "Regular", "Ruim"], horizontal=True)
-                q2 = st.radio("Você acessa o painel preferencialmente por onde?", ["Computador", "Celular", "Tablet"], horizontal=True)
-                q3 = st.radio("Qual aba você menos utiliza?", ["Itens Programados", "Crédito", "Estoque", "Fotos RDQ", "Certificados", "Notas Fiscais", "Uso todas"])
+            # Layout: [FORMULÁRIO, VAZIO]
+            # O formulário fica colado na esquerda e estreito
+            c_form, c_vazio = st.columns([1, 1.5]) 
+            
+            with c_form:
+                # Inputs e Botões
+                u = st.text_input("Login", placeholder="Usuário").strip()
+                s = st.text_input("Senha", type="password", placeholder="Senha").strip()
                 
-                # Nova Pergunta Múltipla Escolha
-                q4 = st.multiselect("Qual/Quais aba(s) você acha que poderia(m) ser removida(s) pois não terá muita utilização?", ["Itens Programados", "Crédito", "Estoque", "Fotos RDQ", "Certificados", "Notas Fiscais", "Nenhuma"])
+                st.markdown("<br>", unsafe_allow_html=True)
+
+                # Botões
+                c_btn1, c_btn2 = st.columns(2)
+                with c_btn1:
+                    if st.button("Acessar", type="primary", use_container_width=True):
+                        # Validação
+                        df = carregar_usuarios()
+                        if df.empty: st.error("Erro de conexão.")
+                        elif 'Login' not in df.columns or 'Senha' not in df.columns: st.error("Erro técnico.")
+                        else:
+                            try:
+                                user = df[(df['Login'].str.lower() == u.lower()) & (df['Senha'] == s)]
+                                if not user.empty:
+                                    d = user.iloc[0]
+                                    st.session_state.update({
+                                        'logado': True, 
+                                        'usuario_nome': d['Nome Vendedor'].split()[0], 
+                                        'usuario_filtro': d['Nome Vendedor'], 
+                                        'usuario_email': d.get('Email', ''), 
+                                        'usuario_tipo': d['Tipo'],
+                                        'usuario_login': d['Login']
+                                    })
+                                    registrar_acesso(u, d['Nome Vendedor'])
+                                    st.rerun()
+                                else: st.error("Dados incorretos.")
+                            except: st.error("Erro no login.")
                 
-                q5 = st.text_area("Alguma sugestão de melhoria? (Opcional)")
-                
-                if st.form_submit_button("Enviar Respostas", type="primary"):
-                    login_save = st.session_state.get('usuario_login', st.session_state['usuario_filtro'])
-                    nome_save = st.session_state['usuario_filtro']
-                    
-                    # Converte a lista do multiselect para string
-                    remocao_str = ", ".join(q4)
-                    
-                    if salvar_feedback(login_save, nome_save, q1, q2, q3, remocao_str, q5):
-                        st.session_state['feedback_enviado'] = True
-                        st.success("Obrigado pelo feedback! Carregando o painel...")
-                        time.sleep(1.5)
+                with c_btn2:
+                    if st.button("Solicitar Acesso", use_container_width=True): 
+                        st.session_state['fazendo_cadastro'] = True
                         st.rerun()
-                    else:
-                        st.error("Erro ao salvar. Tente novamente.")
-            
-            st.stop() # Bloqueia o resto da execução até votar
+
+        # --- LADO DIREITO (ANIMAÇÃO) ---
+        with col_direita:
+            st.markdown("<br><br>", unsafe_allow_html=True)
+            if lottie_carnaval:
+                st_lottie(lottie_carnaval, height=300, key="carnaval")
+            else:
+                st.markdown("<h1 style='text-align: center; font-size: 80px;'>🎭</h1>", unsafe_allow_html=True)
+else:
 
     with st.sidebar:
         st.write(f"Bem-vindo, **{st.session_state['usuario_nome'].upper()}**")
