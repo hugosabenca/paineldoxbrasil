@@ -7,9 +7,6 @@ import pytz
 import altair as alt
 import time
 from st_aggrid import AgGrid, GridOptionsBuilder, GridUpdateMode, DataReturnMode
-from streamlit_extras.let_it_rain import rain
-import requests
-from streamlit_lottie import st_lottie
 
 # ==============================================================================
 # CONFIGURAÇÕES GERAIS E URLS
@@ -381,6 +378,27 @@ def carregar_dados_titulos():
         return df
     return pd.DataFrame()
 
+@st.cache_data(ttl="1m", show_spinner=False)
+def carregar_dados_manutencao():
+    # Tenta ler a aba Dados_Manutencao
+    df = ler_com_retry(URL_SISTEMA, "Dados_Manutencao")
+    if df is None: return None
+    if not df.empty:
+        # Renomeia as colunas que vêm do Google Forms para facilitar
+        # O Forms geralmente cria "Carimbo de data/hora", "Qual a máquina?", etc.
+        # Vamos normalizar para não dar erro no código.
+        cols_atuais = df.columns.tolist()
+        mapa_colunas = {
+            cols_atuais[0]: "Data_Abertura", # A 1ª coluna é sempre o timestamp
+            cols_atuais[1]: "Maquina",
+            cols_atuais[2]: "Operador",
+            cols_atuais[3]: "Tipo_Problema",
+            cols_atuais[4]: "Descricao"
+        }
+        df = df.rename(columns=mapa_colunas)
+        return df
+    return pd.DataFrame()
+
 # ==============================================================================
 # FUNÇÕES DE ESCRITA
 # ==============================================================================
@@ -446,6 +464,39 @@ def salvar_solicitacao_nota(vendedor_nome, vendedor_email, nf_numero, filial):
             return True
         return False
     except: return False
+
+def atualizar_chamado_manutencao(row_index, status, prioridade, mecanico, inicio, fim, solucao):
+    try:
+        client = get_gspread_client_cached()
+        sheet = client.open_by_url(URL_SISTEMA)
+        worksheet = sheet.worksheet("Dados_Manutencao")
+        
+        # O índice da linha no Google Sheets é = index do dataframe + 2 
+        # (+1 pelo cabeçalho, +1 pq o google começa no 1 e o python no 0)
+        linha_sheet = row_index + 2
+        
+        # Atualiza as colunas de Gestão (F, G, H, I, J, K...)
+        # Ajuste as letras/números das colunas conforme sua planilha real
+        # Supondo: F=Status, G=Prioridade, H=Mecanico, I=Inicio, J=Fim, K=Solucao
+        
+        # Atualiza Status (Coluna 6 se for a F, ou conte na sua planilha)
+        # DICA: Se "Descricao" é a Coluna 5 (E), então Status é 6 (F), Prioridade 7 (G)...
+        
+        # Vamos enviar uma lista para atualizar a linha de uma vez nas colunas certas
+        # Ajuste o range conforme onde você escreveu os cabeçalhos na planilha
+        # Exemplo: Atualizando da coluna 6 (Status) até a 11 (Solucao)
+        
+        worksheet.update_cell(linha_sheet, 6, status)      # Coluna F
+        worksheet.update_cell(linha_sheet, 7, prioridade)  # Coluna G
+        worksheet.update_cell(linha_sheet, 8, mecanico)    # Coluna H
+        worksheet.update_cell(linha_sheet, 9, inicio)      # Coluna I
+        worksheet.update_cell(linha_sheet, 10, fim)        # Coluna J
+        worksheet.update_cell(linha_sheet, 11, solucao)    # Coluna K
+        
+        return True
+    except Exception as e:
+        st.error(f"Erro ao salvar: {e}")
+        return False    
 
 def formatar_peso_brasileiro(valor):
     try:
@@ -1210,6 +1261,237 @@ def exibir_aba_notas(is_admin=False):
             st.rerun()
     else: st.info("Nenhum pedido encontrado.")
 
+def exibir_aba_manutencao():
+    st.subheader("🔧 Gestão de Manutenção (Chão de Fábrica)")
+    
+    # Botão de atualizar geral
+    if st.button("🔄 Atualizar Dados Manutenção"):
+        carregar_dados_manutencao.clear()
+        st.rerun()
+        
+    df = obter_dados_persistentes("cache_manutencao", carregar_dados_manutencao)
+    
+    if df.empty:
+        st.info("Nenhum chamado de manutenção registrado ainda.")
+        return
+
+    # CRIAÇÃO DAS SUB-ABAS
+    tab_gestao, tab_indicadores = st.tabs(["🛠️ Controle de Chamados", "📊 Indicadores & Gráficos"])
+
+    # =========================================================
+    # ABA 1: CONTROLE (OPERACIONAL)
+    # =========================================================
+    with tab_gestao:
+        st.markdown("### 📋 Fila de Chamados Pendentes")
+        
+        # Filtro visual da tabela
+        filtro_status = st.radio("Filtrar Tabela:", ["Pendentes (Abertos/Andamento)", "Histórico Completo"], horizontal=True)
+        
+        if filtro_status == "Pendentes (Abertos/Andamento)":
+            df_show = df[df['Status'].str.strip().str.lower() != 'concluido'].copy()
+        else:
+            df_show = df.copy()
+        
+        st.dataframe(
+            df_show, 
+            use_container_width=True,
+            column_config={
+                "Link_Foto": st.column_config.LinkColumn("Foto"),
+                "Status": st.column_config.Column("Status", help="Situação Atual"),
+                "Data_Abertura": st.column_config.DatetimeColumn("Abertura", format="D/M/Y H:m"),
+            }
+        )
+        
+        st.divider()
+        
+        # --- ÁREA DE EDIÇÃO (BAIXA DE CHAMADO) ---
+        st.markdown("### ✍️ Editar / Dar Baixa")
+        
+        # Lista apenas não concluídos para facilitar a vida do gestor
+        df_pendentes = df[df['Status'].str.strip().str.lower() != 'concluido'].reset_index()
+        
+        if df_pendentes.empty:
+            st.success("🎉 Tudo limpo! Nenhuma manutenção pendente.")
+        else:
+            # Cria lista legível para o selectbox
+            lista_opcoes = df_pendentes.apply(lambda x: f"ID {x['index']} | {x['Data_Abertura']} | {x['Maquina']} | {x['Descricao']}", axis=1).tolist()
+            escolha = st.selectbox("Selecione o chamado para atuar:", lista_opcoes)
+            
+            if escolha:
+                # Pega o ID real
+                id_real = int(escolha.split("|")[0].replace("ID", "").strip())
+                linha_atual = df.loc[id_real]
+                
+                with st.form("form_manutencao_baixa"):
+                    st.info(f"Editando: **{linha_atual['Maquina']}** (Operador: {linha_atual['Operador']})")
+                    st.caption(f"Problema: {linha_atual['Descricao']}")
+                    
+                    # 1. Status e Prioridade e Mecânico
+                    c_m1, c_m2, c_m3 = st.columns(3)
+                    with c_m1:
+                        # Tenta manter o status atual se já existir, senão padrão é Aberto
+                        status_atual = linha_atual.get('Status', 'Aberto')
+                        lista_status = ["Aberto", "Em Andamento", "Concluido"]
+                        idx_status = lista_status.index(status_atual) if status_atual in lista_status else 0
+                        novo_status = st.selectbox("Status", lista_status, index=idx_status)
+                        
+                    with c_m2:
+                        prioridade_atual = linha_atual.get('Prioridade', 'Media')
+                        lista_prio = ["Baixa", "Media", "Alta"]
+                        idx_prio = lista_prio.index(prioridade_atual) if prioridade_atual in lista_prio else 1
+                        nova_prioridade = st.selectbox("Prioridade", lista_prio, index=idx_prio)
+                        
+                    with c_m3:
+                        novo_mecanico = st.text_input("Mecânico Responsável", value=str(linha_atual.get('Mecanico', '')))
+                    
+                    st.markdown("---")
+                    st.markdown("**⏱️ Apontamento de Horas**")
+
+                    # 2. SEPARAÇÃO DE DATA E HORA (INÍCIO)
+                    col_d_ini, col_h_ini = st.columns(2)
+                    with col_d_ini:
+                        d_ini_input = st.date_input("Data Início", value=datetime.now(FUSO_BR), format="DD/MM/YYYY")
+                    with col_h_ini:
+                        h_ini_input = st.time_input("Hora Início", value=datetime.now(FUSO_BR))
+
+                    # 3. SEPARAÇÃO DE DATA E HORA (FIM)
+                    col_d_fim, col_h_fim = st.columns(2)
+                    with col_d_fim:
+                        d_fim_input = st.date_input("Data Fim (Conclusão)", value=datetime.now(FUSO_BR), format="DD/MM/YYYY")
+                    with col_h_fim:
+                        h_fim_input = st.time_input("Hora Fim (Conclusão)", value=datetime.now(FUSO_BR))
+                    
+                    st.markdown("---")
+                    nova_solucao = st.text_area("Solução Aplicada / Peças Trocadas", value=str(linha_atual.get('Solucao', '')))
+                    
+                    if st.form_submit_button("💾 Salvar Apontamento", type="primary"):
+                        # --- CONCATENAÇÃO DOS DADOS ANTES DE SALVAR ---
+                        # Formata para string: "DD/MM/AAAA HH:MM"
+                        str_inicio = f"{d_ini_input.strftime('%d/%m/%Y')} {h_ini_input.strftime('%H:%M')}"
+                        str_fim = f"{d_fim_input.strftime('%d/%m/%Y')} {h_fim_input.strftime('%H:%M')}"
+                        
+                        if atualizar_chamado_manutencao(id_real, novo_status, nova_prioridade, novo_mecanico, str_inicio, str_fim, nova_solucao):
+                            st.success("✅ Chamado atualizado com sucesso!")
+                            carregar_dados_manutencao.clear()
+                            time.sleep(1)
+                            st.rerun()
+                        else:
+                            st.error("Erro ao conectar com a planilha.")
+
+    # =========================================================
+    # ABA 2: INDICADORES (DASHBOARD)
+    # =========================================================
+    with tab_indicadores:
+        st.markdown("### 📊 Dashboard da Manutenção")
+        
+        if df.empty:
+            st.warning("Sem dados para gerar indicadores.")
+        else:
+            # =========================================================
+            # 1. PROCESSAMENTO DOS DADOS (DATAS E HORAS)
+            # =========================================================
+            # CORREÇÃO 1: Pegamos agora SEM fuso horário para bater com a planilha
+            agora_sem_fuso = datetime.now(FUSO_BR).replace(tzinfo=None)
+
+            # Converte textos para data real
+            df['Inicio_Dt'] = pd.to_datetime(df['Data_Inicio'], format='%d/%m/%Y %H:%M', errors='coerce')
+            df['Fim_Dt'] = pd.to_datetime(df['Data_Fim'], format='%d/%m/%Y %H:%M', errors='coerce')
+            
+            # Para o Gráfico de Gantt: Se não tem data fim, usamos "Agora" (sem fuso)
+            df['Fim_Visual'] = df['Fim_Dt'].fillna(agora_sem_fuso)
+            
+            # Calcula duração em Horas (para o Pareto de Tempo e MTTR)
+            df['Duracao_Horas'] = (df['Fim_Dt'] - df['Inicio_Dt']).dt.total_seconds() / 3600
+            
+            # =========================================================
+            # 2. INDICADORES KPI (MTTR / MTBF)
+            # =========================================================
+            df_concluido = df.dropna(subset=['Inicio_Dt', 'Fim_Dt'])
+            
+            # Cálculo MTTR (Média de horas por reparo)
+            mttr_val = df_concluido['Duracao_Horas'].mean() if not df_concluido.empty else 0
+            
+            # Cálculo MTBF (Estimativa: Horas totais do período / Qtd Quebras)
+            if len(df) > 1:
+                inicio_periodo = df['Inicio_Dt'].min()
+                # CORREÇÃO 2: Usamos a variável sem fuso para subtrair
+                fim_periodo = agora_sem_fuso
+                horas_totais_calendario = (fim_periodo - inicio_periodo).total_seconds() / 3600
+                mtbf_val = horas_totais_calendario / len(df)
+            else:
+                mtbf_val = 0
+
+            # Exibe os Cartões
+            k1, k2, k3, k4 = st.columns(4)
+            k1.metric("Chamados Totais", len(df))
+            k2.metric("Concluídos", len(df_concluido))
+            k3.metric("MTTR (Tempo Médio)", f"{mttr_val:.1f} h", help="Média de horas que a máquina fica parada consertando.")
+            k4.metric("MTBF (Tempo Entre Falhas)", f"{mtbf_val:.1f} h", help="Em média, a cada quantas horas ocorre uma nova quebra.")
+            
+            st.divider()
+
+            # =========================================================
+            # 3. NOVOS GRÁFICOS
+            # =========================================================
+            
+            # --- A. GRÁFICO DE GANTT (LINHA DO TEMPO) ---
+            st.markdown("#### ⏳ Linha do Tempo de Paradas (Gantt)")
+            st.caption("Visualize quando cada máquina parou e quanto tempo ficou parada.")
+            
+            df_gantt = df.dropna(subset=['Inicio_Dt']).copy()
+            
+            if not df_gantt.empty:
+                gantt = alt.Chart(df_gantt).mark_bar().encode(
+                    x=alt.X('Inicio_Dt', title='Início'),
+                    x2='Fim_Visual', 
+                    y=alt.Y('Maquina', title=None),
+                    color=alt.Color('Tipo_Problema', legend=alt.Legend(title="Tipo")),
+                    tooltip=['Maquina', 'Tipo_Problema', 'Operador', 'Status']
+                ).properties(height=300)
+                st.altair_chart(gantt, use_container_width=True)
+            else:
+                st.info("Sem datas de início válidas para gerar o Gantt.")
+
+            st.divider()
+
+            col_g1, col_g2 = st.columns(2)
+
+            # --- B. PARETO DE TEMPO (HORAS PARADAS) ---
+            with col_g1:
+                st.markdown("#### 🕒 Horas Totais Paradas (Gargalo)")
+                st.caption("Quais máquinas ficaram mais tempo sem produzir?")
+                
+                # Agrupa e soma as horas
+                if not df_concluido.empty:
+                    df_horas = df_concluido.groupby('Maquina')['Duracao_Horas'].sum().reset_index()
+                    df_horas.columns = ['Maquina', 'Horas_Totais']
+                    
+                    graf_horas = alt.Chart(df_horas).mark_bar().encode(
+                        x=alt.X('Horas_Totais', title='Horas Paradas'),
+                        y=alt.Y('Maquina', sort='-x', title=None),
+                        color=alt.value('#d62728'), # Vermelho
+                        tooltip=['Maquina', 'Horas_Totais']
+                    ).properties(height=300)
+                    st.altair_chart(graf_horas, use_container_width=True)
+                else:
+                    st.info("Sem manutenções concluídas para calcular horas.")
+
+            # --- C. PARETO DE QUANTIDADE ---
+            with col_g2:
+                st.markdown("#### 🔢 Quantidade de Quebras")
+                st.caption("Quais máquinas quebram mais vezes?")
+                
+                df_qtd = df['Maquina'].value_counts().reset_index()
+                df_qtd.columns = ['Maquina', 'Qtd']
+                
+                graf_qtd = alt.Chart(df_qtd).mark_bar().encode(
+                    x=alt.X('Qtd', title='Nº de Chamados'),
+                    y=alt.Y('Maquina', sort='-x', title=None),
+                    color=alt.value('#0078D4'), # Azul
+                    tooltip=['Maquina', 'Qtd']
+                ).properties(height=300)
+                st.altair_chart(graf_qtd, use_container_width=True)
+
 # --- SESSÃO ---
 if 'logado' not in st.session_state:
     st.session_state['logado'] = False
@@ -1219,6 +1501,7 @@ if 'logado' not in st.session_state:
     st.session_state['usuario_tipo'] = ""
 if 'fazendo_cadastro' not in st.session_state: st.session_state['fazendo_cadastro'] = False
 
+# --- LOGIN ---
 # --- LOGIN ---
 if not st.session_state['logado']:
     if st.session_state['fazendo_cadastro']:
@@ -1236,81 +1519,54 @@ if not st.session_state['logado']:
             if c2.form_submit_button("Voltar", use_container_width=True): st.session_state['fazendo_cadastro'] = False; st.rerun()
     else:
         # =================================================================
-        # TELA DE LOGIN: SEM LINHA, ALINHADA À ESQUERDA E ESTREITA
+        # TELA DE LOGIN: ALINHADA À ESQUERDA E COMPACTA
         # =================================================================
         
-        # 1. EFEITO CARNAVAL
-        try:
-            rain(emoji="🎭", font_size=50, falling_speed=6, animation_length="infinite")
-        except: pass
+        # Cria duas colunas: A primeira estreita para o login, a segunda vazia para preencher o resto
+        col_login, col_vazia = st.columns([1, 2]) 
 
-        # 2. CARREGAR ANIMAÇÃO
-        def load_lottieurl(url):
-            try:
-                r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=5)
-                if r.status_code != 200: return None
-                return r.json()
-            except: return None
-
-        lottie_carnaval = load_lottieurl("https://assets5.lottiefiles.com/packages/lf20_u4yrau.json")
-
-        # 3. DIVISÃO DA TELA (ESQUERDA vs DIREITA)
-        col_esquerda, col_direita = st.columns([1.5, 1]) 
-
-        # --- LADO ESQUERDO ---
-        with col_esquerda:
+        with col_login:
+            st.markdown("<br>", unsafe_allow_html=True) 
             st.title("🔒 Login - Painel Dox")
-            # (A linha divisória foi removida daqui)
+            st.markdown("---")
             
-            # Layout: [FORMULÁRIO, VAZIO]
-            # O formulário fica colado na esquerda e estreito
-            c_form, c_vazio = st.columns([1, 1.5]) 
+            # Inputs
+            u = st.text_input("Login", placeholder="Digite seu usuário").strip()
+            s = st.text_input("Senha", type="password", placeholder="Digite sua senha").strip()
             
-            with c_form:
-                # Inputs e Botões
-                u = st.text_input("Login", placeholder="Usuário").strip()
-                s = st.text_input("Senha", type="password", placeholder="Senha").strip()
-                
-                st.markdown("<br>", unsafe_allow_html=True)
+            st.markdown("<br>", unsafe_allow_html=True)
 
-                # Botões
-                c_btn1, c_btn2 = st.columns(2)
-                with c_btn1:
-                    if st.button("Acessar", type="primary", use_container_width=True):
-                        # Validação
-                        df = carregar_usuarios()
-                        if df.empty: st.error("Erro de conexão.")
-                        elif 'Login' not in df.columns or 'Senha' not in df.columns: st.error("Erro técnico.")
-                        else:
-                            try:
-                                user = df[(df['Login'].str.lower() == u.lower()) & (df['Senha'] == s)]
-                                if not user.empty:
-                                    d = user.iloc[0]
-                                    st.session_state.update({
-                                        'logado': True, 
-                                        'usuario_nome': d['Nome Vendedor'].split()[0], 
-                                        'usuario_filtro': d['Nome Vendedor'], 
-                                        'usuario_email': d.get('Email', ''), 
-                                        'usuario_tipo': d['Tipo'],
-                                        'usuario_login': d['Login']
-                                    })
-                                    registrar_acesso(u, d['Nome Vendedor'])
-                                    st.rerun()
-                                else: st.error("Dados incorretos.")
-                            except: st.error("Erro no login.")
-                
-                with c_btn2:
-                    if st.button("Solicitar Acesso", use_container_width=True): 
-                        st.session_state['fazendo_cadastro'] = True
-                        st.rerun()
-
-        # --- LADO DIREITO (ANIMAÇÃO) ---
-        with col_direita:
-            st.markdown("<br><br>", unsafe_allow_html=True)
-            if lottie_carnaval:
-                st_lottie(lottie_carnaval, height=300, key="carnaval")
-            else:
-                st.markdown("<h1 style='text-align: center; font-size: 80px;'>🎭</h1>", unsafe_allow_html=True)
+            # Botões
+            c_btn1, c_btn2 = st.columns(2)
+            with c_btn1:
+                if st.button("Acessar", type="primary", use_container_width=True):
+                    # Validação
+                    df = carregar_usuarios()
+                    if df.empty: st.error("Erro de conexão.")
+                    elif 'Login' not in df.columns or 'Senha' not in df.columns: st.error("Erro técnico.")
+                    else:
+                        try:
+                            user = df[(df['Login'].str.lower() == u.lower()) & (df['Senha'] == s)]
+                            if not user.empty:
+                                d = user.iloc[0]
+                                st.session_state.update({
+                                    'logado': True, 
+                                    'usuario_nome': d['Nome Vendedor'].split()[0], 
+                                    'usuario_filtro': d['Nome Vendedor'], 
+                                    'usuario_email': d.get('Email', ''), 
+                                    'usuario_tipo': d['Tipo'],
+                                    'usuario_login': d['Login']
+                                })
+                                registrar_acesso(u, d['Nome Vendedor'])
+                                st.rerun()
+                            else: st.error("Dados incorretos.")
+                        except Exception as e:
+                            st.error(f"Erro no login: {e}")
+            
+            with c_btn2:
+                if st.button("Solicitar Acesso", use_container_width=True): 
+                    st.session_state['fazendo_cadastro'] = True
+                    st.rerun()
 else:
 
     with st.sidebar:
@@ -1355,17 +1611,20 @@ else:
                 st.metric("Total (Tons)", f"{total_tons:,.2f}".replace(",", "X").replace(".", ",").replace("X", "."))
 
     if st.session_state['usuario_tipo'].lower() == "admin":
-        a1, a2, a3, a4, a5, a6, a7, a8, a9, a10 = st.tabs(["📂 Itens Programados", "💰 Crédito", "📦 Estoque", "📷 Fotos RDQ", "📝 Acessos", "📑 Certificados", "🧾 Notas Fiscais", "🔍 Logs", "📊 Faturamento", "🏭 Produção"])
+        # Adicionei "🔧 Manutenção" na lista
+        a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11 = st.tabs(["📂 Itens Programados", "💰 Crédito", "📦 Estoque", "📷 Fotos RDQ", "📝 Acessos", "📑 Certificados", "🧾 Notas Fiscais", "🔍 Logs", "📊 Faturamento", "🏭 Produção", "🔧 Manutenção"])
+        
         with a1: exibir_carteira_pedidos()
         with a2: exibir_aba_credito()
-        with a3: exibir_aba_estoque() # <--- NOVA ABA
-        with a4: exibir_aba_fotos(True) # ADMIN COM ACESSO TOTAL
+        with a3: exibir_aba_estoque()
+        with a4: exibir_aba_fotos(True)
         with a5: st.dataframe(carregar_solicitacoes(), use_container_width=True)
         with a6: exibir_aba_certificados(True)
         with a7: exibir_aba_notas(True) 
         with a8: st.dataframe(carregar_logs_acessos(), use_container_width=True)
         with a9: exibir_aba_faturamento()
         with a10: exibir_aba_producao()
+        with a11: exibir_aba_manutencao() # <--- NOVA ABA AQUI
         
     elif st.session_state['usuario_tipo'].lower() == "master":
         a1, a2, a3, a4, a5, a6, a7, a8 = st.tabs(["📂 Itens Programados", "💰 Crédito", "📦 Estoque", "📷 Fotos RDQ", "📑 Certificados", "🧾 Notas Fiscais", "📊 Faturamento", "🏭 Produção"])
