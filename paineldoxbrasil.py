@@ -172,6 +172,7 @@ def carregar_usuarios():
     if df_users is not None and not df_users.empty: return df_users.astype(str)
     return pd.DataFrame()
 
+
 @st.cache_data(ttl="10m", show_spinner=False)
 def ler_dados_nuvem_generico(aba, url_planilha):
     df = ler_com_retry(url_planilha, aba)
@@ -310,6 +311,42 @@ def carregar_logs_acessos():
             except: pass
         return df
     return pd.DataFrame(columns=["Data", "Login", "Nome"])
+
+@st.cache_data(ttl="10m", show_spinner=False)
+def carregar_feedbacks_avisos():
+    df = ler_com_retry(URL_SISTEMA, "Feedback_Vendedores")
+    if df is None: return pd.DataFrame()
+    return df
+
+def registrar_ciencia_aviso(login, nome):
+    try:
+        agora_br = datetime.now(FUSO_BR).strftime("%d/%m/%Y %H:%M:%S")
+        # Estrutura com as 10 colunas exatas. As antigas de feedback ficam em branco ("").
+        nova_linha = pd.DataFrame([{
+            "Data": agora_br, 
+            "Login": login, 
+            "Nome": nome, 
+            "Satisfacao": "", 
+            "Dispositivo": "", 
+            "Aba_Menos_Usada": "", 
+            "Abas_Remover": "", 
+            "Sugestao": "", 
+            "Tipo_Aviso": "Status_Servidor", 
+            "Mensagem": "Ciente"
+        }])
+        
+        if escrever_no_sheets(URL_SISTEMA, "Feedback_Vendedores", nova_linha, modo="append"):
+            carregar_feedbacks_avisos.clear()
+            return True
+        return False
+    except:
+        return False
+
+@st.cache_data(ttl="2m", show_spinner=False)
+def carregar_status_robo():
+    df = ler_com_retry(URL_SISTEMA, "Status_Robo", tentativas=2, espera=1)
+    if df is None: return None
+    return df
 
 @st.cache_data(ttl="15m", show_spinner=False)
 def carregar_dados_pedidos():
@@ -885,6 +922,38 @@ def exibir_carteira_pedidos():
             st.dataframe(df_exibicao, hide_index=True, use_container_width=True, column_config={"Prazo": st.column_config.TextColumn("Previsão"), "Filial_Origem": st.column_config.TextColumn("Filial")})
             if texto_busca and df_exibicao.empty: st.warning(f"Nenhum resultado encontrado para '{texto_busca}'")
     else: st.error("Não foi possível carregar a planilha de pedidos. Tente atualizar a página.")
+
+@st.dialog("📡 Novo Recurso: Status do Servidor", width="large")
+def popup_aviso_servidor():
+    # Esse truque em HTML/CSS esconde o botão "X" (Close) no topo do pop-up
+    st.markdown(
+        """
+        <style>
+            button[aria-label="Close"] {
+                display: none !important;
+            }
+        </style>
+        """,
+        unsafe_allow_html=True
+    )
+    
+    st.markdown(f"Olá, **{st.session_state['usuario_nome']}**!")
+    st.markdown("Adicionamos um novo indicador no seu menu lateral para mostrar a 'saúde' da nossa conexão com a fábrica em tempo real.")
+    
+    st.markdown("🟢 **Servidor Online:** Tudo normal! Dados atualizados.")
+    st.markdown("🔴 **Servidor Offline:** Houve uma perda temporária de comunicação com o servidor da Dox.")
+    
+    st.info("**O que muda quando o servidor estiver Offline?**\n\n"
+            "• Os dados do painel podem estar com alguns minutos de atraso, e será normalizado até a conexão ser restabelecida.\n\n"
+            "• Suas solicitações automáticas (**Certificados, Notas Fiscais e Fotos**) ficarão 'na fila'.\n\n"
+            "• **Não precisa pedir de novo!** Assim que a conexão voltar, o sistema processará a fila e enviará tudo para o seu e-mail automaticamente.")
+    
+    if st.button("👍 Entendi e estou ciente", type="primary", use_container_width=True):
+        # Registra na planilha
+        registrar_ciencia_aviso(st.session_state['usuario_login'], st.session_state['usuario_nome'])
+        # Marca na sessão para não abrir de novo hoje
+        st.session_state['viu_aviso_servidor'] = True
+        st.rerun()
 
 # --- DIALOG PARA EXIBIR TÍTULOS ---
 @st.dialog("Detalhes Financeiros", width="large")
@@ -1568,6 +1637,27 @@ if not st.session_state['logado']:
                     st.session_state['fazendo_cadastro'] = True
                     st.rerun()
 else:
+    # =========================================================
+    # VERIFICAÇÃO DO POP-UP DE AVISO (PASSO 3)
+    # =========================================================
+    if 'viu_aviso_servidor' not in st.session_state:
+        df_avisos = obter_dados_persistentes("cache_avisos", carregar_feedbacks_avisos)
+        ja_viu = False
+        
+        if isinstance(df_avisos, pd.DataFrame) and not df_avisos.empty:
+            # Verifica se as colunas necessárias existem para não dar erro
+            if 'Login' in df_avisos.columns and 'Tipo_Aviso' in df_avisos.columns:
+                # Procura se já tem uma linha com o Login dele e o Tipo de Aviso "Status_Servidor"
+                filtro = df_avisos[(df_avisos['Login'].str.lower() == st.session_state['usuario_login'].lower()) & 
+                                   (df_avisos['Tipo_Aviso'] == 'Status_Servidor')]
+                if not filtro.empty:
+                    ja_viu = True
+        
+        if not ja_viu:
+            popup_aviso_servidor()
+        else:
+            st.session_state['viu_aviso_servidor'] = True
+    # =========================================================
 
     with st.sidebar:
         st.write(f"Bem-vindo, **{st.session_state['usuario_nome'].upper()}**")
@@ -1575,18 +1665,48 @@ else:
         dias_semana = {0: 'Segunda-feira', 1: 'Terça-feira', 2: 'Quarta-feira', 3: 'Quinta-feira', 4: 'Sexta-feira', 5: 'Sábado', 6: 'Domingo'}
         meses = {1: 'Janeiro', 2: 'Fevereiro', 3: 'Março', 4: 'Abril', 5: 'Maio', 6: 'Junho', 7: 'Julho', 8: 'Agosto', 9: 'Setembro', 10: 'Outubro', 11: 'Novembro', 12: 'Dezembro'}
         texto_data = f"{dias_semana[agora.weekday()]}, {agora.day} de {meses[agora.month]} de {agora.year}"
-        st.markdown(f"<small><i>{texto_data}</i></small>", unsafe_allow_html=True)
-        st.caption(f"Perfil: {st.session_state['usuario_tipo']}")
-        if st.button("Sair"): st.session_state.update({'logado': False, 'usuario_nome': ""}); st.rerun()
-        st.divider()
-        if st.button("🔄 Atualizar Dados"): 
-            st.cache_data.clear()
-            st.rerun()
+        
+        # Juntamos a data e o perfil no mesmo bloco para economizar espaço
+        st.markdown(f"<small><i>{texto_data}</i><br><span style='color: gray;'>Perfil: {st.session_state['usuario_tipo']}</span></small>", unsafe_allow_html=True)
+        
+        # =========================================================
+        # STATUS DO SERVIDOR (ROBÔ) - COMPACTO
+        # =========================================================
+        df_status = obter_dados_persistentes("cache_status_robo", carregar_status_robo)
+        status_texto = "🔴 Servidor Offline" 
+        
+        if isinstance(df_status, pd.DataFrame) and not df_status.empty and 'Ultima_Atualizacao' in df_status.columns:
+            try:
+                ultima_att_str = str(df_status.iloc[0]['Ultima_Atualizacao'])
+                ultima_att_dt = datetime.strptime(ultima_att_str, '%d/%m/%Y %H:%M:%S')
+                ultima_att_dt = FUSO_BR.localize(ultima_att_dt) 
+                
+                diferenca_minutos = (agora - ultima_att_dt).total_seconds() / 60
+                
+                if diferenca_minutos <= 25:
+                    status_texto = "🟢 Servidor Online"
+            except:
+                pass
+        
+        # Exibe o status com uma margem pequena usando HTML (sem a linha gigante)
+        st.markdown(f"<div style='margin-top: 15px; margin-bottom: 15px;'><b>{status_texto}</b></div>", unsafe_allow_html=True)
+        # =========================================================
+
+        # Botões lado a lado para economizar espaço
+        col_btn1, col_btn2 = st.columns(2)
+        with col_btn1:
+            if st.button("Sair", use_container_width=True): 
+                st.session_state.update({'logado': False, 'usuario_nome': ""})
+                st.rerun()
+        with col_btn2:
+            if st.button("Atualizar", use_container_width=True): 
+                st.cache_data.clear()
+                st.rerun()
+        
+        st.divider() # Deixamos apenas UMA linha divisória antes do desempenho
         
         # --- BLOCO: FATURAMENTO DO VENDEDOR (VISÍVEL APENAS PARA VENDEDOR) ---
         if st.session_state['usuario_tipo'].lower() == "vendedor":
-            st.divider()
-            
             df_fat_vend = carregar_faturamento_vendedores()
             
             if not df_fat_vend.empty and 'VENDEDOR' in df_fat_vend.columns and 'DATA_DT' in df_fat_vend.columns:
@@ -1607,7 +1727,7 @@ else:
                 total_tons = df_user['TONS'].sum()
                 
                 st.markdown(f"### 🎯 Seu Desempenho")
-                st.caption(f"Volume Faturado em {meses[agora.month]}:")
+                st.caption(f"Faturado em {meses[agora.month]}:")
                 st.metric("Total (Tons)", f"{total_tons:,.2f}".replace(",", "X").replace(".", ",").replace("X", "."))
 
     if st.session_state['usuario_tipo'].lower() == "admin":
