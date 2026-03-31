@@ -7,6 +7,7 @@ import pytz
 import altair as alt
 import time
 from st_aggrid import AgGrid, GridOptionsBuilder, GridUpdateMode, DataReturnMode
+import io
 
 # ==============================================================================
 # CONFIGURAÇÕES GERAIS E URLS
@@ -152,6 +153,46 @@ def converte_numero_seguro(valor):
         return float(s)
     except:
         return 0.0
+
+def gerar_excel_formatado(df):
+    output = io.BytesIO()
+    
+    # Cria o arquivo Excel na memória usando o motor xlsxwriter
+    with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
+        df.to_excel(writer, index=False, sheet_name='Dados')
+        workbook = writer.book
+        worksheet = writer.sheets['Dados']
+        
+        # --- FORMATOS VISUAIS ---
+        # Formato do Cabeçalho (Azul corporativo, texto branco, negrito)
+        formato_cabecalho = workbook.add_format({
+            'bold': True,
+            'text_wrap': True,
+            'valign': 'vcenter',
+            'fg_color': '#002060', 
+            'font_color': 'white',
+            'border': 1
+        })
+        
+        # Formato de Texto (Impede o Excel de comer zeros e usar notação científica)
+        formato_texto = workbook.add_format({'num_format': '@'})
+        
+        # --- APLICANDO FORMATOS E LARGURAS ---
+        for col_num, nome_coluna in enumerate(df.columns.values):
+            # Pinta o cabeçalho
+            worksheet.write(0, col_num, nome_coluna, formato_cabecalho)
+            
+            # Calcula a largura ideal da coluna
+            tamanho_max = max(df[nome_coluna].astype(str).map(len).max(), len(str(nome_coluna))) + 2
+            
+            # Se for coluna sensível, aplica o formato de texto na coluna toda
+            colunas_sensiveis = ['PEDIDO', 'LOTE', 'Número do Pedido']
+            if nome_coluna in colunas_sensiveis:
+                worksheet.set_column(col_num, col_num, tamanho_max, formato_texto)
+            else:
+                worksheet.set_column(col_num, col_num, tamanho_max)
+                
+    return output.getvalue()        
 
 def formatar_br_decimal(valor, casas=3):
     try:
@@ -351,6 +392,11 @@ def carregar_status_robo():
 @st.cache_data(ttl="15m", show_spinner=False)
 def carregar_dados_pedidos():
     dados_consolidados = []
+    
+    # --- LISTA DE EMOJIS PARA REMOÇÃO FORÇADA ---
+    emojis_compostos = ['0️⃣', '1️⃣', '2️⃣', '3️⃣', '4️⃣', '5️⃣', '6️⃣', '7️⃣', '8️⃣', '9️⃣', '🔟', 
+                        '🔥', '⭐', '🔴', '🟡', '🟢', '🔵', '⏳', '🟫', '🟨', '⬜️', '🔗', '⚖️', '📡', '❌', '⏸️', '🔄', '☑️']
+
     # Pinheiral
     for aba in ABAS_PINHEIRAL:
         df = ler_com_retry(URL_PINHEIRAL, aba, tentativas=2)
@@ -358,7 +404,6 @@ def carregar_dados_pedidos():
             df = df.astype(str)
             
             # --- TRADUTOR DO PCP ONLINE ---
-            # Transforma os nomes das colunas do PCP Online nos nomes que o Painel Dox já conhece
             df = df.rename(columns={
                 "PEDIDO": "Número do Pedido",
                 "CLIENTE CORRETO": "Cliente Correto",
@@ -370,11 +415,8 @@ def carregar_dados_pedidos():
             })
             
             # --- NOVO: FILTRO DE ITENS AGUARDANDO ---
-            # Garante que a coluna Prazo exista para não dar erro
             if 'Prazo' in df.columns:
-                # 1. Tira tudo que for texto vazio ou só espaços
                 df = df[df['Prazo'].astype(str).str.strip() != ""]
-                # 2. Tira os "fantasmas" que o Pandas cria (nan, none, nat)
                 df = df[~df['Prazo'].astype(str).str.lower().isin(['nan', 'none', 'nat', 'null'])]
             # ----------------------------------------
             
@@ -382,12 +424,25 @@ def carregar_dados_pedidos():
             df['Filial_Origem'] = "PINHEIRAL"
             cols_necessarias = ["Número do Pedido", "Cliente Correto", "Produto", "Quantidade", "Prazo", "Vendedor Correto", "Gerente Correto"]
             cols_existentes = [c for c in cols_necessarias if c in df.columns]
+            
             if "Vendedor Correto" in cols_existentes:
                 df_limpo = df[cols_existentes + ['Máquina/Processo', 'Filial_Origem']].copy()
+                
+                # --- NOVO: LAVA-JATO (REMOVEDOR DE EMOJIS) ---
+                colunas_sujas = ["Número do Pedido", "Cliente Correto", "Produto"]
+                for col in colunas_sujas:
+                    if col in df_limpo.columns:
+                        for e in emojis_compostos:
+                            df_limpo[col] = df_limpo[col].str.replace(e, '', regex=False)
+                        # Remove qualquer outro símbolo estranho e espaços duplos
+                        df_limpo[col] = df_limpo[col].str.replace(r'[^\w\s\.,\-\/\(\)]', '', regex=True).str.strip()
+                # ---------------------------------------------
+                
                 if "Número do Pedido" in df_limpo.columns:
                     df_limpo["Número do Pedido"] = df_limpo["Número do Pedido"].str.replace(r'\.0$', '', regex=True).str.strip().str.zfill(6)
                 dados_consolidados.append(df_limpo)
         time.sleep(0.5)
+
     # Bicas
     for aba in ABAS_BICAS:
         df = ler_com_retry(URL_BICAS, aba, tentativas=2)
@@ -397,8 +452,20 @@ def carregar_dados_pedidos():
             df['Filial_Origem'] = "SJ BICAS"
             cols_necessarias = ["Número do Pedido", "Cliente Correto", "Produto", "Quantidade", "Prazo", "Vendedor Correto", "Gerente Correto"]
             cols_existentes = [c for c in cols_necessarias if c in df.columns]
+            
             if "Vendedor Correto" in cols_existentes:
                 df_limpo = df[cols_existentes + ['Máquina/Processo', 'Filial_Origem']].copy()
+                
+                # --- NOVO: LAVA-JATO (REMOVEDOR DE EMOJIS) ---
+                colunas_sujas = ["Número do Pedido", "Cliente Correto", "Produto"]
+                for col in colunas_sujas:
+                    if col in df_limpo.columns:
+                        for e in emojis_compostos:
+                            df_limpo[col] = df_limpo[col].str.replace(e, '', regex=False)
+                        # Remove qualquer outro símbolo estranho e espaços duplos
+                        df_limpo[col] = df_limpo[col].str.replace(r'[^\w\s\.,\-\/\(\)]', '', regex=True).str.strip()
+                # ---------------------------------------------
+                
                 if "Número do Pedido" in df_limpo.columns:
                     df_limpo["Número do Pedido"] = df_limpo["Número do Pedido"].str.replace(r'\.0$', '', regex=True).str.strip().str.zfill(6)
                 dados_consolidados.append(df_limpo)
@@ -888,6 +955,161 @@ def exibir_aba_estoque():
         allow_unsafe_jscode=True
     )
 
+def exibir_aba_carteira_geral():
+    tipo_usuario = st.session_state['usuario_tipo'].lower()
+    nome_filtro = st.session_state['usuario_filtro']
+    
+    # Puxa os dados que o robô já manda para a aba Carteira
+    df_carteira = obter_dados_persistentes("cache_carteira_cred", carregar_dados_carteira)
+    
+    if df_carteira.empty:
+        st.info("Nenhum dado de carteira carregado.")
+        return
+
+    df_c = df_carteira.copy()
+    
+    # =========================================================================
+    # LÓGICA DE TRADUÇÃO (O CÉREBRO)
+    # =========================================================================
+    
+    # 1. Identificar a coluna chave (Aceita PED/PROP SF ou PED/PROP SF2)
+    col_chave = 'PED/PROP SF'
+    if 'PED/PROP SF2' in df_c.columns:
+        col_chave = 'PED/PROP SF2'
+
+    # 2. Separa SAO PAULO para ser o Dicionário
+    df_sp = df_c[df_c['FILIAL'] == 'SAO PAULO'].copy()
+    
+    if not df_sp.empty and col_chave in df_sp.columns:
+        # Limpa as chaves para cruzamento exato
+        df_sp = df_sp[df_sp[col_chave].astype(str).str.strip() != '']
+        df_sp['CHAVE_SP'] = df_sp[col_chave].astype(str).str.strip().str.lstrip('0')
+        df_sp_unique = df_sp.drop_duplicates(subset=['CHAVE_SP']).set_index('CHAVE_SP')[['CLIENTE', 'VENDEDOR', 'GERENTE']]
+        
+        # 3. Acha as linhas das outras filiais que são DOX BRASIL
+        df_c['CLIENTE_UPPER'] = df_c['CLIENTE'].astype(str).str.upper()
+        mask_dox = df_c['CLIENTE_UPPER'].str.contains("DOX BRASIL", na=False)
+        
+        # 4. Pega as chaves da origem para traduzir
+        ped_sf_keys = df_c.loc[mask_dox, col_chave].astype(str).str.strip().str.lstrip('0')
+        
+        # 5. Aplica a Tradução
+        for col in ['CLIENTE', 'VENDEDOR', 'GERENTE']:
+            if col in df_sp_unique.columns:
+                mapped_values = ped_sf_keys.map(df_sp_unique[col])
+                df_c.loc[mask_dox, col] = mapped_values.fillna(df_c.loc[mask_dox, col])
+        
+        df_c = df_c.drop(columns=['CLIENTE_UPPER'])
+    
+    # 6. Oculta SAO PAULO (Limpa a tabela final para exibir)
+    df_c = df_c[df_c['FILIAL'] != 'SAO PAULO']
+    
+    # --- NOVO: FILTRO DE FILIAL ---
+    lista_filiais = ["Todas"] + sorted(df_c['FILIAL'].dropna().unique().tolist())
+    filtro_filial = st.selectbox("Selecione a Filial:", lista_filiais, key="filial_carteira")
+    if filtro_filial != "Todas":
+        df_c = df_c[df_c['FILIAL'] == filtro_filial]
+
+    # =========================================================================
+    # APLICAÇÃO DE REGRAS DE PERFIL
+    # =========================================================================
+    if tipo_usuario in ["admin", "gerente", "master", "logística", "logistica", "pcp"]:
+        vendedores_unicos = sorted(df_c["VENDEDOR"].dropna().unique())
+        filtro_vendedor = st.selectbox("Filtrar Vendedor (Carteira)", ["Todos"] + vendedores_unicos)
+        if filtro_vendedor != "Todos": 
+            df_filtrado = df_c[df_c["VENDEDOR"] == filtro_vendedor].copy()
+        else: 
+            df_filtrado = df_c.copy()
+            
+    elif tipo_usuario == "gerente comercial":
+        nome_busca = nome_filtro.lower().strip()
+        mask_gerente = pd.Series(False, index=df_c.index)
+        mask_vendedor = pd.Series(False, index=df_c.index)
+        
+        if "GERENTE" in df_c.columns: 
+            df_c["GERENTE_CLEAN"] = df_c["GERENTE"].astype(str).str.lower().str.strip()
+            mask_gerente = df_c["GERENTE_CLEAN"].str.contains(nome_busca, na=False)
+            
+        if "VENDEDOR" in df_c.columns:
+            df_c["VENDEDOR_CLEAN"] = df_c["VENDEDOR"].astype(str).str.lower().str.strip()
+            mask_vendedor = df_c["VENDEDOR_CLEAN"].str.contains(nome_busca, regex=False, na=False)
+            
+        # O símbolo '|' significa "OU" (Junta o que ele é gerente com o que ele é vendedor)
+        df_filtrado = df_c[mask_gerente | mask_vendedor].copy()
+            
+    else: # Vendedores Padrão
+        if "VENDEDOR" in df_c.columns:
+            df_c["VENDEDOR_CLEAN"] = df_c["VENDEDOR"].astype(str).str.lower().str.strip()
+            df_filtrado = df_c[df_c["VENDEDOR_CLEAN"].str.contains(nome_filtro.lower().strip(), regex=False, na=False)].copy()
+        else:
+            df_filtrado = pd.DataFrame()
+            
+    # =========================================================================
+    # MONTAGEM DA UI (TABELA)
+    # =========================================================================
+    if df_filtrado.empty:
+        st.info("Sua carteira de pedidos está vazia ou não há resultados para o filtro.")
+        return
+
+    # Cálculos Totais
+    df_filtrado['TONS_NUM'] = df_filtrado['TONS'].apply(converte_numero_seguro)
+    total_pedidos = len(df_filtrado)
+    total_peso = df_filtrado['TONS_NUM'].sum()
+    total_peso_str = f"{total_peso:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+    
+    kpi1, kpi2 = st.columns(2)
+    kpi1.metric("Total de Pedidos Abertos:", total_pedidos)
+    kpi2.metric("Volume Total (Tons):", total_peso_str)
+    st.divider()
+
+    # Filtro de Busca da Tabela
+    texto_busca = st.text_input("🔍 Buscar na Carteira (Cliente, Pedido, Produto, Lote...):")
+    
+    df_show = df_filtrado.copy()
+    df_show['PESO (TONS)'] = df_show['TONS_NUM'].apply(formatar_peso_brasileiro)
+    df_show = df_show.rename(columns={"TONS": "TONS_ORIGINAL"}) # Proteção
+    
+    # Configuração de Colunas Base
+    colunas_visiveis = ["PEDIDO", "FILIAL", "CLIENTE", "LOTE", "PRODUTO", "PESO (TONS)", "STATUS"]
+    
+    # Adiciona a coluna Vendedor para todos os perfis de gestão (incluindo o gerente comercial)
+    if tipo_usuario in ["admin", "gerente", "gerente comercial", "master", "logística", "logistica", "pcp"]: 
+        colunas_visiveis.insert(3, "VENDEDOR")
+        
+    # Adiciona a coluna Gerente APENAS para os perfis de visão global (exclui o 'gerente comercial')
+    if tipo_usuario in ["admin", "gerente", "master", "logística", "logistica", "pcp"]:
+        if "GERENTE" in df_show.columns:
+            colunas_visiveis.insert(4, "GERENTE")
+
+    if texto_busca:
+        mask = df_show.astype(str).apply(lambda x: x.str.contains(texto_busca, case=False, na=False)).any(axis=1)
+        df_show = df_show[mask]
+        
+    if df_show.empty:
+        st.warning(f"Nenhum resultado encontrado para '{texto_busca}'")
+    else:
+        cols_finais = [c for c in colunas_visiveis if c in df_show.columns]
+        st.dataframe(
+            df_show[cols_finais], 
+            hide_index=True, 
+            use_container_width=True,
+            column_config={
+                "FILIAL": st.column_config.TextColumn("Filial"),
+                "CLIENTE": st.column_config.TextColumn("Cliente", width="large"),
+                "PRODUTO": st.column_config.TextColumn("Produto", width="large")
+            }
+        )
+
+        # --- NOVO: BOTÃO DE DOWNLOAD EXCEL FORMATADO ---
+        st.markdown("<br>", unsafe_allow_html=True)
+        excel_carteira = gerar_excel_formatado(df_show[cols_finais])
+        st.download_button(
+            label="📥 Baixar Tabela (Excel)",
+            data=excel_carteira,
+            file_name=f"Carteira_Pedidos_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key="btn_down_carteira"
+        )
 
 def exibir_carteira_pedidos():
     tipo_usuario = st.session_state['usuario_tipo'].lower()
@@ -908,8 +1130,17 @@ def exibir_carteira_pedidos():
             if filtro_vendedor != "Todos": df_filtrado = df_total[df_total["Vendedor Correto"] == filtro_vendedor].copy()
             else: df_filtrado = df_total.copy()
         elif tipo_usuario == "gerente comercial":
-            if "Gerente Correto" in df_total.columns: df_filtrado = df_total[df_total["Gerente Correto"].str.lower() == nome_filtro.lower()].copy()
-            else: df_filtrado = pd.DataFrame()
+            nome_busca = nome_filtro.lower().strip()
+            mask_gerente = pd.Series(False, index=df_total.index)
+            mask_vendedor = pd.Series(False, index=df_total.index)
+            
+            if "Gerente Correto" in df_total.columns: 
+                mask_gerente = df_total["Gerente Correto"].astype(str).str.lower().str.strip().str.contains(nome_busca, na=False)
+                
+            if "Vendedor Correto" in df_total.columns:
+                mask_vendedor = df_total["Vendedor Correto"].astype(str).str.lower().str.strip().str.contains(nome_busca, regex=False, na=False)
+                
+            df_filtrado = df_total[mask_gerente | mask_vendedor].copy()
         else: 
             df_filtrado = df_total[df_total["Vendedor Correto"].str.lower().str.contains(nome_filtro.lower(), regex=False, na=False)].copy()
         if df_filtrado.empty: st.info(f"Nenhum pedido pendente encontrado para a filial selecionada.")
@@ -942,8 +1173,22 @@ def exibir_carteira_pedidos():
                 df_exibicao = df_final[mask]
             else: df_exibicao = df_final
             st.dataframe(df_exibicao, hide_index=True, use_container_width=True, column_config={"Prazo": st.column_config.TextColumn("Previsão"), "Filial_Origem": st.column_config.TextColumn("Filial")})
+            
             if texto_busca and df_exibicao.empty: st.warning(f"Nenhum resultado encontrado para '{texto_busca}'")
-    else: st.error("Não foi possível carregar a planilha de pedidos. Tente atualizar a página.")
+            
+            # --- NOVO: BOTÃO DE DOWNLOAD EXCEL FORMATADO ---
+            st.markdown("<br>", unsafe_allow_html=True)
+            excel_itens = gerar_excel_formatado(df_exibicao)
+            st.download_button(
+                label="📥 Baixar Tabela (Excel)",
+                data=excel_itens,
+                file_name=f"Itens_Programados_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                key="btn_down_itens"
+            )
+            
+    else: 
+        st.error("Não foi possível carregar a planilha de pedidos. Tente atualizar a página.")
 
 @st.dialog("📡 Novo Recurso: Status do Servidor", width="large")
 def popup_aviso_servidor():
@@ -1753,9 +1998,10 @@ else:
                 st.metric("Total (Tons)", f"{total_tons:,.2f}".replace(",", "X").replace(".", ",").replace("X", "."))
 
     if st.session_state['usuario_tipo'].lower() == "admin":
-        # Adicionei "🔧 Manutenção" na lista
-        a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11 = st.tabs(["📂 Itens Programados", "💰 Crédito", "📦 Estoque", "📷 Fotos RDQ", "📝 Acessos", "📑 Certificados", "🧾 Notas Fiscais", "🔍 Logs", "📊 Faturamento", "🏭 Produção", "🔧 Manutenção"])
+        # Adicionei "📂 Carteira" no início (a0)
+        a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11 = st.tabs(["📂 Carteira", "📂 Itens Programados", "💰 Crédito", "📦 Estoque", "📷 Fotos RDQ", "📝 Acessos", "📑 Certificados", "🧾 Notas Fiscais", "🔍 Logs", "📊 Faturamento", "🏭 Produção", "🔧 Manutenção"])
         
+        with a0: exibir_aba_carteira_geral()
         with a1: exibir_carteira_pedidos()
         with a2: exibir_aba_credito()
         with a3: exibir_aba_estoque()
@@ -1766,26 +2012,28 @@ else:
         with a8: st.dataframe(carregar_logs_acessos(), use_container_width=True)
         with a9: exibir_aba_faturamento()
         with a10: exibir_aba_producao()
-        with a11: exibir_aba_manutencao() # <--- NOVA ABA AQUI
+        with a11: exibir_aba_manutencao() 
         
     elif st.session_state['usuario_tipo'].lower() == "master":
-        a1, a2, a3, a4, a5, a6, a7, a8 = st.tabs(["📂 Itens Programados", "💰 Crédito", "📦 Estoque", "📷 Fotos RDQ", "📑 Certificados", "🧾 Notas Fiscais", "📊 Faturamento", "🏭 Produção"])
+        a0, a1, a2, a3, a4, a5, a6, a7, a8 = st.tabs(["📂 Carteira", "📂 Itens Programados", "💰 Crédito", "📦 Estoque", "📷 Fotos RDQ", "📑 Certificados", "🧾 Notas Fiscais", "📊 Faturamento", "🏭 Produção"])
+        with a0: exibir_aba_carteira_geral()
         with a1: exibir_carteira_pedidos()
         with a2: exibir_aba_credito()
-        with a3: exibir_aba_estoque() # <--- NOVA ABA
-        with a4: exibir_aba_fotos(False) # VISÃO NORMAL
+        with a3: exibir_aba_estoque() 
+        with a4: exibir_aba_fotos(False) 
         with a5: exibir_aba_certificados(False) 
         with a6: exibir_aba_notas(False)        
         with a7: exibir_aba_faturamento()
         with a8: exibir_aba_producao()
 
     elif st.session_state['usuario_tipo'].lower() in ["logística", "logistica", "pcp"]:
-        a1, a2, a3, a4, a5 = st.tabs(["📂 Itens Programados", "📦 Estoque", "📷 Fotos RDQ", "📑 Certificados", "🧾 Notas Fiscais"])
+        a0, a1, a2, a3, a4, a5 = st.tabs(["📂 Carteira", "📂 Itens Programados", "📦 Estoque", "📷 Fotos RDQ", "📑 Certificados", "🧾 Notas Fiscais"])
+        with a0: exibir_aba_carteira_geral()
         with a1: exibir_carteira_pedidos()
         with a2: exibir_aba_estoque()
-        with a3: exibir_aba_fotos(True) # Visão de gestão (vê tudo)
-        with a4: exibir_aba_certificados(True) # Visão de gestão (vê tudo)
-        with a5: exibir_aba_notas(True) # Visão de gestão (vê tudo)
+        with a3: exibir_aba_fotos(True) 
+        with a4: exibir_aba_certificados(True) 
+        with a5: exibir_aba_notas(True) 
 
     elif st.session_state['usuario_tipo'].lower() in ["manutenção", "manutencao"]:
         tabs_manu = st.tabs(["🔧 Manutenção"])
@@ -1793,16 +2041,17 @@ else:
 
     elif st.session_state['usuario_tipo'].lower() == "qualidade":
         a1, a2, a3 = st.tabs(["📷 Fotos RDQ", "📑 Certificados", "🧾 Notas Fiscais"])
-        with a1: exibir_aba_fotos(True) # Visão de gestão
-        with a2: exibir_aba_certificados(True) # Visão de gestão
-        with a3: exibir_aba_notas(True) # Visão de gestão    
+        with a1: exibir_aba_fotos(True) 
+        with a2: exibir_aba_certificados(True) 
+        with a3: exibir_aba_notas(True)    
         
     else:
-        # Vendedores e Gerentes Padrão - ABA ESTOQUE ADICIONADA
-        a1, a2, a3, a4, a5, a6 = st.tabs(["📂 Itens Programados", "💰 Crédito", "📦 Estoque", "📷 Fotos RDQ", "📑 Certificados", "🧾 Notas Fiscais"])
+        # Vendedores e Gerentes Padrão
+        a0, a1, a2, a3, a4, a5, a6 = st.tabs(["📂 Carteira", "📂 Itens Programados", "💰 Crédito", "📦 Estoque", "📷 Fotos RDQ", "📑 Certificados", "🧾 Notas Fiscais"])
+        with a0: exibir_aba_carteira_geral()
         with a1: exibir_carteira_pedidos()
         with a2: exibir_aba_credito()
-        with a3: exibir_aba_estoque() # <--- NOVA ABA
-        with a4: exibir_aba_fotos(False) # VISÃO NORMAL
+        with a3: exibir_aba_estoque() 
+        with a4: exibir_aba_fotos(False) 
         with a5: exibir_aba_certificados(False)
         with a6: exibir_aba_notas(False)
