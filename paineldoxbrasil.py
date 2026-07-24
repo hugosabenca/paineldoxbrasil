@@ -1871,6 +1871,31 @@ if 'fazendo_cadastro' not in st.session_state: st.session_state['fazendo_cadastr
 # --- LOGIN ---
 # --- LOGIN ---
 if not st.session_state['logado']:
+
+    # =========================================================
+    # ASSINATURA DO CRIADOR (APARECE SÓ NO LOGIN)
+    # =========================================================
+    st.markdown("""
+    <style>
+    .assinatura-hugo {
+        position: fixed;
+        bottom: 10px;
+        left: 50%;
+        transform: translateX(-50%);
+        color: #888888;
+        font-size: 14px;
+        font-style: italic;
+        z-index: 100;
+        background-color: rgba(255, 255, 255, 0.6); 
+        padding: 4px 12px;
+        border-radius: 10px;
+        text-align: center;
+        white-space: nowrap;
+    }
+    </style>
+    <div class="assinatura-hugo">Criado por <b>Hugo Sabença</b></div>
+    """, unsafe_allow_html=True)
+    # =========================================================
     if st.session_state['fazendo_cadastro']:
         st.title("📝 Solicitação de Acesso")
         with st.form("form_cadastro"):
@@ -1897,43 +1922,49 @@ if not st.session_state['logado']:
             st.title("🔒 Login - Painel Dox")
             st.markdown("---")
             
-            # Inputs
-            u = st.text_input("Login", placeholder="Digite seu usuário").strip()
-            s = st.text_input("Senha", type="password", placeholder="Digite sua senha").strip()
-            
-            st.markdown("<br>", unsafe_allow_html=True)
+            # 1. EMPACOTAMENTO: Cria o formulário para "travar" a sincronização
+            with st.form("form_login"):
+                # Inputs
+                u = st.text_input("Login", placeholder="Digite seu usuário").strip()
+                s = st.text_input("Senha", type="password", placeholder="Digite sua senha").strip()
+                
+                st.markdown("<br>", unsafe_allow_html=True)
 
-            # Botões
-            c_btn1, c_btn2 = st.columns(2)
-            with c_btn1:
-                if st.button("Acessar", type="primary", use_container_width=True):
-                    # Validação
-                    df = carregar_usuarios()
-                    if df.empty: st.error("Erro de conexão.")
-                    elif 'Login' not in df.columns or 'Senha' not in df.columns: st.error("Erro técnico.")
-                    else:
-                        try:
-                            user = df[(df['Login'].str.lower() == u.lower()) & (df['Senha'] == s)]
-                            if not user.empty:
-                                d = user.iloc[0]
-                                st.session_state.update({
-                                    'logado': True, 
-                                    'usuario_nome': d['Nome Vendedor'].split()[0], 
-                                    'usuario_filtro': d['Nome Vendedor'], 
-                                    'usuario_email': d.get('Email', ''), 
-                                    'usuario_tipo': d['Tipo'],
-                                    'usuario_login': d['Login']
-                                })
-                                registrar_acesso(u, d['Nome Vendedor'])
-                                st.rerun()
-                            else: st.error("Dados incorretos.")
-                        except Exception as e:
-                            st.error(f"Erro no login: {e}")
+                # Botões viram submit_buttons
+                c_btn1, c_btn2 = st.columns(2)
+                with c_btn1:
+                    btn_acessar = st.form_submit_button("Acessar", type="primary", use_container_width=True)
+                with c_btn2:
+                    btn_solicitar = st.form_submit_button("Solicitar Acesso", use_container_width=True)
             
-            with c_btn2:
-                if st.button("Solicitar Acesso", use_container_width=True): 
-                    st.session_state['fazendo_cadastro'] = True
-                    st.rerun()
+            # 2. LÓGICA DE VALIDAÇÃO: Fica FORA do 'with st.form', mas DENTRO da 'with col_login'
+            if btn_acessar:
+                # Validação
+                df = carregar_usuarios()
+                if df.empty: st.error("Erro de conexão.")
+                elif 'Login' not in df.columns or 'Senha' not in df.columns: st.error("Erro técnico.")
+                else:
+                    try:
+                        user = df[(df['Login'].str.strip().str.lower() == u.lower()) & (df['Senha'].str.strip() == s)]
+                        if not user.empty:
+                            d = user.iloc[0]
+                            st.session_state.update({
+                                'logado': True, 
+                                'usuario_nome': d['Nome Vendedor'].split()[0], 
+                                'usuario_filtro': d['Nome Vendedor'], 
+                                'usuario_email': d.get('Email', ''), 
+                                'usuario_tipo': d['Tipo'],
+                                'usuario_login': d['Login']
+                            })
+                            registrar_acesso(u, d['Nome Vendedor'])
+                            st.rerun()
+                        else: st.error("Dados incorretos.")
+                    except Exception as e:
+                        st.error(f"Erro no login: {e}")
+            
+            if btn_solicitar:
+                st.session_state['fazendo_cadastro'] = True
+                st.rerun()
 else:
     # =========================================================
     # VERIFICAÇÃO DO POP-UP DE AVISO: NOVA ABA CARTEIRA
@@ -2006,7 +2037,8 @@ else:
         
         # --- BLOCO: FATURAMENTO DO VENDEDOR (VISÍVEL APENAS PARA VENDEDOR) ---
         if st.session_state['usuario_tipo'].lower() == "vendedor":
-            df_fat_vend = carregar_faturamento_vendedores()
+            # Usa a sua função de blindagem para usar o cache antigo e nunca retornar 'None'
+            df_fat_vend = obter_dados_persistentes("cache_fat_vendedor", carregar_faturamento_vendedores)
             
             if not df_fat_vend.empty and 'VENDEDOR' in df_fat_vend.columns and 'DATA_DT' in df_fat_vend.columns:
                 usuario_atual = st.session_state['usuario_filtro']
@@ -2029,61 +2061,63 @@ else:
                 st.caption(f"Faturado em {meses[agora.month]}:")
                 st.metric("Total (Tons)", f"{total_tons:,.2f}".replace(",", "X").replace(".", ",").replace("X", "."))
 
-    if st.session_state['usuario_tipo'].lower() == "admin":
-        # Adicionei "📂 Carteira" no início (a0)
-        a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11 = st.tabs(["📂 Carteira", "📂 Itens Programados", "💰 Crédito", "📦 Estoque", "📷 Fotos RDQ", "📝 Acessos", "📑 Certificados", "🧾 Notas Fiscais", "🔍 Logs", "📊 Faturamento", "🏭 Produção", "🔧 Manutenção"])
+    with st.spinner("Os dados estão sendo sincronizados com o servidor. Por favor, aguarde um instante... ⏳"):
         
-        with a0: exibir_aba_carteira_geral()
-        with a1: exibir_carteira_pedidos()
-        with a2: exibir_aba_credito()
-        with a3: exibir_aba_estoque()
-        with a4: exibir_aba_fotos(True)
-        with a5: st.dataframe(carregar_solicitacoes(), use_container_width=True)
-        with a6: exibir_aba_certificados(True)
-        with a7: exibir_aba_notas(True) 
-        with a8: st.dataframe(carregar_logs_acessos(), use_container_width=True)
-        with a9: exibir_aba_faturamento()
-        with a10: exibir_aba_producao()
-        with a11: exibir_aba_manutencao() 
-        
-    elif st.session_state['usuario_tipo'].lower() == "master":
-        a0, a1, a2, a3, a4, a5, a6, a7, a8 = st.tabs(["📂 Carteira", "📂 Itens Programados", "💰 Crédito", "📦 Estoque", "📷 Fotos RDQ", "📑 Certificados", "🧾 Notas Fiscais", "📊 Faturamento", "🏭 Produção"])
-        with a0: exibir_aba_carteira_geral()
-        with a1: exibir_carteira_pedidos()
-        with a2: exibir_aba_credito()
-        with a3: exibir_aba_estoque() 
-        with a4: exibir_aba_fotos(False) 
-        with a5: exibir_aba_certificados(False) 
-        with a6: exibir_aba_notas(False)        
-        with a7: exibir_aba_faturamento()
-        with a8: exibir_aba_producao()
+        if st.session_state['usuario_tipo'].lower() == "admin":
+            # Adicionei "📂 Carteira" no início (a0)
+            a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11 = st.tabs(["📂 Carteira", "📂 Itens Programados", "💰 Crédito", "📦 Estoque", "📷 Fotos RDQ", "📝 Acessos", "📑 Certificados", "🧾 Notas Fiscais", "🔍 Logs", "📊 Faturamento", "🏭 Produção", "🔧 Manutenção"])
+            
+            with a0: exibir_aba_carteira_geral()
+            with a1: exibir_carteira_pedidos()
+            with a2: exibir_aba_credito()
+            with a3: exibir_aba_estoque()
+            with a4: exibir_aba_fotos(True)
+            with a5: st.dataframe(carregar_solicitacoes(), use_container_width=True)
+            with a6: exibir_aba_certificados(True)
+            with a7: exibir_aba_notas(True) 
+            with a8: st.dataframe(carregar_logs_acessos(), use_container_width=True)
+            with a9: exibir_aba_faturamento()
+            with a10: exibir_aba_producao()
+            with a11: exibir_aba_manutencao() 
+            
+        elif st.session_state['usuario_tipo'].lower() == "master":
+            a0, a1, a2, a3, a4, a5, a6, a7, a8 = st.tabs(["📂 Carteira", "📂 Itens Programados", "💰 Crédito", "📦 Estoque", "📷 Fotos RDQ", "📑 Certificados", "🧾 Notas Fiscais", "📊 Faturamento", "🏭 Produção"])
+            with a0: exibir_aba_carteira_geral()
+            with a1: exibir_carteira_pedidos()
+            with a2: exibir_aba_credito()
+            with a3: exibir_aba_estoque() 
+            with a4: exibir_aba_fotos(False) 
+            with a5: exibir_aba_certificados(False) 
+            with a6: exibir_aba_notas(False)        
+            with a7: exibir_aba_faturamento()
+            with a8: exibir_aba_producao()
 
-    elif st.session_state['usuario_tipo'].lower() in ["logística", "logistica", "pcp"]:
-        a0, a1, a2, a3, a4, a5 = st.tabs(["📂 Carteira", "📂 Itens Programados", "📦 Estoque", "📷 Fotos RDQ", "📑 Certificados", "🧾 Notas Fiscais"])
-        with a0: exibir_aba_carteira_geral()
-        with a1: exibir_carteira_pedidos()
-        with a2: exibir_aba_estoque()
-        with a3: exibir_aba_fotos(True) 
-        with a4: exibir_aba_certificados(True) 
-        with a5: exibir_aba_notas(True) 
+        elif st.session_state['usuario_tipo'].lower() in ["logística", "logistica", "pcp"]:
+            a0, a1, a2, a3, a4, a5 = st.tabs(["📂 Carteira", "📂 Itens Programados", "📦 Estoque", "📷 Fotos RDQ", "📑 Certificados", "🧾 Notas Fiscais"])
+            with a0: exibir_aba_carteira_geral()
+            with a1: exibir_carteira_pedidos()
+            with a2: exibir_aba_estoque()
+            with a3: exibir_aba_fotos(True) 
+            with a4: exibir_aba_certificados(True) 
+            with a5: exibir_aba_notas(True) 
 
-    elif st.session_state['usuario_tipo'].lower() in ["manutenção", "manutencao"]:
-        tabs_manu = st.tabs(["🔧 Manutenção"])
-        with tabs_manu[0]: exibir_aba_manutencao()
+        elif st.session_state['usuario_tipo'].lower() in ["manutenção", "manutencao"]:
+            tabs_manu = st.tabs(["🔧 Manutenção"])
+            with tabs_manu[0]: exibir_aba_manutencao()
 
-    elif st.session_state['usuario_tipo'].lower() == "qualidade":
-        a1, a2, a3 = st.tabs(["📷 Fotos RDQ", "📑 Certificados", "🧾 Notas Fiscais"])
-        with a1: exibir_aba_fotos(True) 
-        with a2: exibir_aba_certificados(True) 
-        with a3: exibir_aba_notas(True)    
-        
-    else:
-        # Vendedores e Gerentes Padrão
-        a0, a1, a2, a3, a4, a5, a6 = st.tabs(["📂 Carteira", "📂 Itens Programados", "💰 Crédito", "📦 Estoque", "📷 Fotos RDQ", "📑 Certificados", "🧾 Notas Fiscais"])
-        with a0: exibir_aba_carteira_geral()
-        with a1: exibir_carteira_pedidos()
-        with a2: exibir_aba_credito()
-        with a3: exibir_aba_estoque() 
-        with a4: exibir_aba_fotos(False) 
-        with a5: exibir_aba_certificados(False)
-        with a6: exibir_aba_notas(False)
+        elif st.session_state['usuario_tipo'].lower() == "qualidade":
+            a1, a2, a3 = st.tabs(["📷 Fotos RDQ", "📑 Certificados", "🧾 Notas Fiscais"])
+            with a1: exibir_aba_fotos(True) 
+            with a2: exibir_aba_certificados(True) 
+            with a3: exibir_aba_notas(True)    
+            
+        else:
+            # Vendedores e Gerentes Padrão
+            a0, a1, a2, a3, a4, a5, a6 = st.tabs(["📂 Carteira", "📂 Itens Programados", "💰 Crédito", "📦 Estoque", "📷 Fotos RDQ", "📑 Certificados", "🧾 Notas Fiscais"])
+            with a0: exibir_aba_carteira_geral()
+            with a1: exibir_carteira_pedidos()
+            with a2: exibir_aba_credito()
+            with a3: exibir_aba_estoque() 
+            with a4: exibir_aba_fotos(False) 
+            with a5: exibir_aba_certificados(False)
+            with a6: exibir_aba_notas(False)
