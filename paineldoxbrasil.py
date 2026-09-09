@@ -6,6 +6,11 @@ from datetime import datetime, timedelta
 import pytz
 import altair as alt
 import time
+import math
+import unicodedata
+import holidays
+import threading
+from streamlit.runtime.scriptrunner import add_script_run_ctx, get_script_run_ctx
 from st_aggrid import AgGrid, GridOptionsBuilder, GridUpdateMode, DataReturnMode
 import io
 
@@ -493,6 +498,43 @@ def carregar_dados_carteira():
         df.columns = df.columns.str.strip().str.upper()
         return df
     return pd.DataFrame()
+
+@st.cache_data(ttl="5m", show_spinner=False)
+def carregar_dados_pedidos_faturados():
+    df = ler_com_retry(URL_SISTEMA, "Dados_Pedidos_Faturados")
+    if df is None: return None
+    if not df.empty:
+        df = df.astype(str)
+        df.columns = df.columns.str.strip().str.upper()
+        return df
+    return pd.DataFrame()
+
+def _carregar_aba_com_protecao_vazio(nome_aba, tentativas=3, espera_segundos=3):
+    """
+    Lê uma aba do Sheets com proteção contra 'flagra vazio' (o robô limpa e reescreve
+    a aba periodicamente; se lermos bem nesse instante, pode vir vazio por engano).
+    Tenta de novo antes de aceitar um resultado vazio como válido.
+    """
+    for tentativa in range(tentativas):
+        df = ler_com_retry(URL_SISTEMA, nome_aba)
+        if df is None:
+            return None
+        if not df.empty:
+            df = df.astype(str)
+            df.columns = df.columns.str.strip().str.upper()
+            return df
+        if tentativa < tentativas - 1:
+            time.sleep(espera_segundos)
+    return pd.DataFrame()
+
+@st.cache_data(ttl="2h", show_spinner=False)
+def carregar_cache_distancias_painel():
+    return _carregar_aba_com_protecao_vazio("Cache_Distancias")
+
+@st.cache_data(ttl="2h", show_spinner=False)
+def carregar_cache_ceps_painel():
+    return _carregar_aba_com_protecao_vazio("Cache_CEPs")
+
 
 @st.cache_data(ttl="5m", show_spinner=False)
 def carregar_dados_titulos():
@@ -1189,6 +1231,481 @@ def exibir_carteira_pedidos():
             
     else: 
         st.error("Não foi possível carregar a planilha de pedidos. Tente atualizar a página.")
+
+def _normalizar_produto_mp(texto):
+    return ' '.join(str(texto).upper().split())
+
+def _normalizar_texto_mp(texto):
+    if not texto:
+        return ""
+    texto = str(texto).strip().upper().replace('-', ' ')
+    texto = unicodedata.normalize('NFKD', texto).encode('ASCII', 'ignore').decode('ASCII')
+    return ' '.join(texto.split())
+
+def _normalizar_cep_mp(cep):
+    if not cep:
+        return ""
+    return ''.join(filter(str.isdigit, str(cep)))
+
+@st.cache_data(ttl="5m", show_spinner=False)
+def _montar_pedidos_meus_pedidos(_df_carteira, _df_faturados, _df_distancias, _df_programados, _df_ceps,
+                                  tipo_usuario, nome_filtro, filtro_vendedor, filtro_filial):
+    df_carteira, df_faturados, df_distancias, df_programados, df_ceps = (
+        _df_carteira, _df_faturados, _df_distancias, _df_programados, _df_ceps
+    )
+    df_carteira = df_carteira.copy()
+
+    if tipo_usuario in ["admin", "gerente", "master", "logística", "logistica", "pcp"]:
+        df_carteira_f = df_carteira[df_carteira['VENDEDOR'] == filtro_vendedor].copy() if filtro_vendedor != "Todos" else df_carteira.copy()
+    elif tipo_usuario == "gerente comercial":
+        nome_busca = nome_filtro.lower().strip()
+        mask_g = df_carteira.get('GERENTE', pd.Series(dtype=str)).astype(str).str.lower().str.contains(nome_busca, na=False)
+        mask_v = df_carteira.get('VENDEDOR', pd.Series(dtype=str)).astype(str).str.lower().str.contains(nome_busca, na=False)
+        df_carteira_f = df_carteira[mask_g | mask_v].copy()
+    else:
+        df_carteira_f = df_carteira[df_carteira['VENDEDOR'].astype(str).str.lower().str.contains(nome_filtro.lower(), regex=False, na=False)].copy()
+
+    df_fat_f = pd.DataFrame()
+    if isinstance(df_faturados, pd.DataFrame) and not df_faturados.empty and 'PEDIDO' in df_faturados.columns:
+        df_faturados = df_faturados.copy()
+        if tipo_usuario in ["admin", "gerente", "master", "logística", "logistica", "pcp"]:
+            df_fat_f = df_faturados.copy() if filtro_vendedor == "Todos" else df_faturados[df_faturados['VENDEDOR'] == filtro_vendedor].copy()
+        elif tipo_usuario == "gerente comercial":
+            nome_busca = nome_filtro.lower().strip()
+            mask_g = df_faturados.get('GERENTE', pd.Series(dtype=str)).astype(str).str.lower().str.contains(nome_busca, na=False)
+            mask_v = df_faturados.get('VENDEDOR', pd.Series(dtype=str)).astype(str).str.lower().str.contains(nome_busca, na=False)
+            df_fat_f = df_faturados[mask_g | mask_v].copy()
+        else:
+            df_fat_f = df_faturados[df_faturados.get('VENDEDOR', pd.Series(dtype=str)).astype(str).str.lower().str.contains(nome_filtro.lower(), regex=False, na=False)].copy()
+
+    if filtro_filial != "Todos":
+        df_carteira_f = df_carteira_f[df_carteira_f['FILIAL'] == filtro_filial].copy()
+        if not df_fat_f.empty:
+            df_fat_f = df_fat_f[df_fat_f['FILIAL'] == filtro_filial].copy()
+
+    if df_carteira_f.empty and df_fat_f.empty:
+        return []
+
+    programados_set = set()
+    programados_prazo = {}
+    programados_por_pedido_debug = {}  # pedido -> lista de (produto original, produto normalizado)
+    if isinstance(df_programados, pd.DataFrame) and not df_programados.empty:
+        if 'Número do Pedido' in df_programados.columns and 'Produto' in df_programados.columns:
+            for _, r in df_programados.iterrows():
+                pedido_num = str(r['Número do Pedido']).strip()
+                produto_norm = _normalizar_produto_mp(r['Produto'])
+                chave = (pedido_num, produto_norm)
+                programados_set.add(chave)
+                programados_por_pedido_debug.setdefault(pedido_num, []).append((r['Produto'], produto_norm))
+                if 'Prazo' in df_programados.columns:
+                    prazo_dt = pd.to_datetime(r['Prazo'], dayfirst=True, errors='coerce')
+                    if pd.notna(prazo_dt):
+                        programados_prazo[chave] = prazo_dt
+
+    def _status_item(row):
+        lote = str(row.get('LOTE', '')).strip()
+        if lote and lote.lower() not in ('nan', 'none', ''):
+            return 2
+        chave = (str(row.get('PEDIDO', '')).strip(), _normalizar_produto_mp(row.get('PRODUTO', '')))
+        return 1 if chave in programados_set else 0
+
+    df_carteira_f['STATUS_ORDEM'] = df_carteira_f.apply(_status_item, axis=1)
+    df_carteira_f['TONS_NUM'] = df_carteira_f['TONS'].apply(converte_numero_seguro)
+    df_carteira_f['ENTREGA_DT'] = pd.to_datetime(df_carteira_f['ENTREGA'], dayfirst=True, errors='coerce') if 'ENTREGA' in df_carteira_f.columns else pd.NaT
+
+    if not df_fat_f.empty:
+        df_fat_f['TONS_NUM'] = df_fat_f['TONS'].apply(converte_numero_seguro) if 'TONS' in df_fat_f.columns else 0
+        df_fat_f['EMISSAO_DT'] = pd.to_datetime(df_fat_f['EMISSAO_NF'], dayfirst=True, errors='coerce') if 'EMISSAO_NF' in df_fat_f.columns else pd.NaT
+
+    cache_dist = {}
+    if isinstance(df_distancias, pd.DataFrame) and not df_distancias.empty:
+        for _, r in df_distancias.iterrows():
+            try:
+                cache_dist[(str(r['FILIAL']).upper(), str(r['MUNICIPIO']).upper(), str(r['UF']).upper())] = float(str(r['TEMPO_HORAS']).replace(',', '.'))
+            except Exception:
+                continue
+
+
+    cache_ceps = {}
+    if isinstance(df_ceps, pd.DataFrame) and not df_ceps.empty:
+        for _, r in df_ceps.iterrows():
+            try:
+                cache_ceps[_normalizar_cep_mp(r['CEP'])] = (str(r['MUNICIPIO']).upper(), str(r['UF']).upper())
+            except Exception:
+                continue
+
+    def _resolver_destino(cep_bruto, municipio_bruto, uf_bruto):
+        cep_norm = _normalizar_cep_mp(cep_bruto)
+        if cep_norm in cache_ceps:
+            return cache_ceps[cep_norm]
+        return _normalizar_texto_mp(municipio_bruto), str(uf_bruto).strip().upper()
+
+    DIAS_FOLGA_SEGURANCA = 1  # margem extra pra imprevistos (fila de descarga, feriado, etc.)
+    DIAS_TOLERANCIA_FATURADO = 5  # depois desse prazo da previsão de chegada, o pedido some da lista
+
+    def _calcular_eta(data_ref, filial, municipio, uf):
+        if data_ref is None or pd.isna(data_ref):
+            return None
+        tempo_horas = cache_dist.get((str(filial).upper(), str(municipio).upper(), str(uf).upper()))
+        if tempo_horas is None:
+            return None
+        dias_viagem = 0 if tempo_horas <= 1 else max(1, math.ceil(tempo_horas / 10))
+        data_calculada = data_ref.normalize() + timedelta(days=dias_viagem + DIAS_FOLGA_SEGURANCA)
+
+        # Se cair em fim de semana ou feriado (nacional/estadual do destino), empurra pro próximo dia útil
+        uf_valida = str(uf).strip().upper()
+        try:
+            feriados_uf = holidays.Brazil(state=uf_valida, years=range(data_calculada.year, data_calculada.year + 2))
+        except Exception:
+            feriados_uf = holidays.Brazil(years=range(data_calculada.year, data_calculada.year + 2))
+
+        while data_calculada.weekday() >= 5 or data_calculada.date() in feriados_uf:
+            data_calculada += timedelta(days=1)
+
+        return data_calculada
+
+    todos_numeros_pedido = set(df_carteira_f['PEDIDO'].astype(str))
+    if not df_fat_f.empty:
+        todos_numeros_pedido |= set(df_fat_f['PEDIDO'].astype(str))
+
+    hoje_naive = datetime.now(FUSO_BR).replace(tzinfo=None)
+    pedidos_final = []
+
+    for pedido in todos_numeros_pedido:
+        itens_abertos = df_carteira_f[df_carteira_f['PEDIDO'].astype(str) == pedido]
+        itens_fat = df_fat_f[df_fat_f['PEDIDO'].astype(str) == pedido] if not df_fat_f.empty else pd.DataFrame()
+
+        linha_ref = itens_abertos.iloc[0] if not itens_abertos.empty else itens_fat.iloc[0]
+        filial = linha_ref.get('FILIAL', '')
+        cep_entrega_bruto = linha_ref.get('CEP_ENTREGA', '')
+        municipio_bruto = linha_ref.get('MUNICIPIO_ENTREGA', linha_ref.get('MUNICIPIO', ''))
+        uf_bruto = linha_ref.get('UF_ENTREGA', linha_ref.get('UF', ''))
+        municipio_entrega, uf_entrega = _resolver_destino(cep_entrega_bruto, municipio_bruto, uf_bruto)
+        cliente_entrega = linha_ref.get('CLIENTE_ENTREGA', linha_ref.get('CLIENTE', ''))
+        cliente = linha_ref.get('CLIENTE', '')
+        triangular = False
+        linhas_itens = []
+        etas = []
+
+        for _, item in itens_abertos.iterrows():
+            status_txt = {0: "Aberto", 1: "Programado", 2: "Pronto"}[item['STATUS_ORDEM']]
+            chave_item = (pedido, _normalizar_produto_mp(item.get('PRODUTO', '')))
+            lote_val = str(item.get('LOTE', '') or '').strip()
+            lote_mp_val = str(item.get('LOTE MP', '') or '').strip()
+            inconsistente = status_txt != "Pronto" and not lote_val and not lote_mp_val
+
+            if inconsistente:
+                prazo_maquina = "Verificar inconsistência com a Logística"
+                previsao_chegada = "Verificar inconsistência com a Logística"
+            elif status_txt == "Aberto":
+                prazo_maquina = "Aguardando Programar"
+                previsao_chegada = "Aguardando Ficar Pronto"
+            elif status_txt == "Programado":
+                prazo_maquina = programados_prazo.get(chave_item, item.get('ENTREGA_DT'))
+                previsao_chegada = "Aguardando Ficar Pronto"
+            else:  # Pronto — já passou dessa etapa, a data de "ficar pronto" não é mais relevante
+                prazo_maquina = None
+                previsao_chegada = "Aguardando Logística"
+
+            if str(item.get('TRIANGULAR', 'N')) == 'S': triangular = True
+            debug_produtos_pedido = programados_por_pedido_debug.get(pedido, [])
+            linhas_itens.append({
+                'PRODUTO': item.get('PRODUTO', ''), 'TONS': item.get('TONS_NUM', 0),
+                'LOTE': item.get('LOTE', ''), 'LOTE_MP': item.get('LOTE MP', ''),
+                'STATUS_ITEM': status_txt, 'DATA_REF': prazo_maquina, 'PREVISAO_CHEGADA': previsao_chegada,
+                'INCONSISTENTE': inconsistente,
+                'DEBUG_PRODUTO_NORM': _normalizar_produto_mp(item.get('PRODUTO', '')),
+                'DEBUG_PRODUTOS_PROGRAMADOS': debug_produtos_pedido,
+            })
+
+        for _, item in itens_fat.iterrows():
+            prazo_maquina = None  # já foi faturado — "prev. ficar pronto" não se aplica mais
+            eta = _calcular_eta(item.get('EMISSAO_DT'), filial, municipio_entrega, uf_entrega)
+            if eta is not None: etas.append(eta)
+            if str(item.get('TRIANGULAR', 'N')) == 'S': triangular = True
+            linhas_itens.append({
+                'PRODUTO': item.get('PRODUTO', ''), 'TONS': item.get('TONS_NUM', 0),
+                'LOTE': item.get('LOTE', ''), 'LOTE_MP': item.get('LOTE MP', ''),
+                'STATUS_ITEM': "Faturado", 'DATA_REF': prazo_maquina, 'PREVISAO_CHEGADA': eta,
+                'INCONSISTENTE': False,
+            })
+
+        if itens_abertos.empty:
+            status_geral_ordem, status_geral_txt = 3, "Faturado"
+            eta_maxima = max(etas) if etas else None
+            if eta_maxima is not None and (hoje_naive - eta_maxima).days > DIAS_TOLERANCIA_FATURADO:
+                continue
+        else:
+            status_geral_ordem = itens_abertos['STATUS_ORDEM'].min()
+            status_geral_txt = {0: "Aberto", 1: "Programado", 2: "Pronto"}[status_geral_ordem]
+
+        chave_cache_debug = (str(filial).upper(), municipio_entrega, uf_entrega)
+        pedidos_final.append({
+            'PEDIDO': pedido, 'FILIAL': filial, 'CLIENTE': cliente, 'TRIANGULAR': triangular,
+            'CLIENTE_ENTREGA': cliente_entrega, 'MUNICIPIO_ENTREGA': municipio_entrega, 'UF_ENTREGA': uf_entrega,
+            'STATUS_ORDEM': status_geral_ordem, 'STATUS_TEXTO': status_geral_txt,
+            'PESO_TOTAL': sum(l['TONS'] for l in linhas_itens),
+            'ITENS': pd.DataFrame(linhas_itens),
+            'PRAZO_DT': max(etas) if etas else None,
+            'TEM_ITENS_FATURADOS': not itens_fat.empty,
+            'DEBUG_CEP_BRUTO': cep_entrega_bruto,
+            'DEBUG_CHAVE_CACHE': chave_cache_debug,
+            'DEBUG_ACHOU_DISTANCIA': chave_cache_debug in cache_dist,
+        })
+
+    return pedidos_final
+
+
+def _carregar_dados_meus_pedidos_paralelo():
+    """
+    Busca as 5 fontes de dados da aba Meus Pedidos ao mesmo tempo (em paralelo),
+    em vez de uma esperando a outra terminar. Se alguma falhar, obter_dados_persistentes
+    já cuida de usar o dado antigo guardado na memória — igual sempre fez.
+    """
+    ctx = get_script_run_ctx()
+    resultados = {}
+
+    tarefas = [
+        ("carteira", "cache_carteira_mp", carregar_dados_carteira),
+        ("faturados", "cache_pedidos_faturados", carregar_dados_pedidos_faturados),
+        ("distancias", "cache_distancias_mp", carregar_cache_distancias_painel),
+        ("programados", "cache_pedidos_mp", carregar_dados_pedidos),
+        ("ceps", "cache_ceps_mp", carregar_cache_ceps_painel),
+    ]
+
+    def _executar(nome, chave_sessao, funcao_carregamento):
+        resultados[nome] = obter_dados_persistentes(chave_sessao, funcao_carregamento)
+
+    threads = []
+    for nome, chave, funcao in tarefas:
+        t = threading.Thread(target=_executar, args=(nome, chave, funcao))
+        add_script_run_ctx(t, ctx)  # conecta essa tarefa paralela ao contexto da tela do Streamlit
+        threads.append(t)
+        t.start()
+
+    for t in threads:
+        t.join()  # espera todas terminarem antes de seguir
+
+    return resultados
+
+def _traduzir_pedidos_transferencia_dox(df_carteira):
+    """
+    Pedidos de transferência entre filiais aparecem com CLIENTE = 'DOX BRASIL...'
+    e sem vendedor/gerente na filial de origem — o dado real está na 'perna'
+    desse mesmo pedido registrada na filial SAO PAULO. Traduz esses campos
+    igual já é feito na aba Carteira geral.
+    """
+    df_c = df_carteira.copy()
+    col_chave = 'PED/PROP SF'
+    if 'PED/PROP SF2' in df_c.columns:
+        col_chave = 'PED/PROP SF2'
+    if col_chave not in df_c.columns or 'FILIAL' not in df_c.columns:
+        return df_c
+
+    df_sp = df_c[df_c['FILIAL'] == 'SAO PAULO'].copy()
+    if df_sp.empty:
+        return df_c
+
+    df_sp = df_sp[df_sp[col_chave].astype(str).str.strip() != '']
+    if df_sp.empty:
+        return df_c
+
+    df_sp['CHAVE_SP'] = df_sp[col_chave].astype(str).str.strip().str.lstrip('0')
+    df_sp_unique = df_sp.drop_duplicates(subset=['CHAVE_SP']).set_index('CHAVE_SP')[['CLIENTE', 'VENDEDOR', 'GERENTE']]
+
+    df_c['CLIENTE_UPPER'] = df_c['CLIENTE'].astype(str).str.upper()
+    mask_dox = df_c['CLIENTE_UPPER'].str.contains("DOX BRASIL", na=False)
+    ped_sf_keys = df_c.loc[mask_dox, col_chave].astype(str).str.strip().str.lstrip('0')
+
+    for col in ['CLIENTE', 'VENDEDOR', 'GERENTE']:
+        if col in df_sp_unique.columns:
+            mapped_values = ped_sf_keys.map(df_sp_unique[col])
+            df_c.loc[mask_dox, col] = mapped_values.fillna(df_c.loc[mask_dox, col])
+
+    return df_c.drop(columns=['CLIENTE_UPPER'])
+
+
+def exibir_meus_pedidos():
+    tipo_usuario = st.session_state['usuario_tipo'].lower()
+    nome_filtro = st.session_state['usuario_filtro']
+
+    dados_carregados = _carregar_dados_meus_pedidos_paralelo()
+    df_carteira = dados_carregados["carteira"]
+    df_faturados = dados_carregados["faturados"]
+    df_distancias = dados_carregados["distancias"]
+    df_programados = dados_carregados["programados"]
+    df_ceps = dados_carregados["ceps"]
+
+    if df_carteira is None or df_carteira.empty:
+        st.info("Não foi possível carregar os dados da Carteira no momento.")
+        return
+
+    # Traduz pedidos de transferência (CLIENTE = 'DOX BRASIL...') usando a perna
+    # do pedido registrada em SAO PAULO — precisa acontecer ANTES de filtrar as filiais,
+    # porque SAO PAULO é justamente a filial que vai ser removida a seguir.
+    # Aplica na Carteira E nos Faturados (mesmo mecanismo pode acontecer nos dois).
+    df_carteira = _traduzir_pedidos_transferencia_dox(df_carteira)
+    if isinstance(df_faturados, pd.DataFrame) and not df_faturados.empty:
+        df_faturados = _traduzir_pedidos_transferencia_dox(df_faturados)
+
+    # Hoje só Pinheiral e SJ Bicas têm produção — as demais filiais (incluindo SAO PAULO,
+    # que já cumpriu seu papel na tradução acima) são removidas agora.
+    FILIAIS_COM_PRODUCAO = ["PINHEIRAL", "SJ BICAS"]
+    df_carteira = df_carteira[df_carteira['FILIAL'].astype(str).str.upper().isin(FILIAIS_COM_PRODUCAO)].copy()
+    if isinstance(df_faturados, pd.DataFrame) and not df_faturados.empty and 'FILIAL' in df_faturados.columns:
+        df_faturados = df_faturados[df_faturados['FILIAL'].astype(str).str.upper().isin(FILIAIS_COM_PRODUCAO)].copy()
+
+    if df_carteira.empty:
+        st.info("Nenhum pedido em aberto nas filiais com produção (Pinheiral / SJ Bicas).")
+        return
+
+    filiais_unicas = sorted(df_carteira['FILIAL'].dropna().unique())
+
+    filtro_vendedor = "Todos"
+    if tipo_usuario in ["admin", "gerente", "master", "logística", "logistica", "pcp"]:
+        col_f1, col_f2 = st.columns(2)
+        with col_f1:
+            vendedores_unicos = sorted(df_carteira['VENDEDOR'].dropna().unique())
+            filtro_vendedor = st.selectbox(f"Filtrar Vendedor ({tipo_usuario.capitalize()})", ["Todos"] + vendedores_unicos, key="mp_filtro_vend")
+        with col_f2:
+            filtro_filial = st.selectbox("Filtrar Filial", ["Todos"] + filiais_unicas, key="mp_filtro_filial")
+    else:
+        filtro_filial = st.selectbox("Filtrar Filial", ["Todos"] + filiais_unicas, key="mp_filtro_filial")
+
+    pedidos_final = _montar_pedidos_meus_pedidos(
+        df_carteira, df_faturados, df_distancias, df_programados, df_ceps,
+        tipo_usuario, nome_filtro, filtro_vendedor, filtro_filial
+    )
+
+    if not pedidos_final:
+        st.info("Nenhum pedido encontrado para os filtros atuais.")
+        return
+
+    nao_faturados = [p for p in pedidos_final if p['STATUS_TEXTO'] != "Faturado"]
+    total_abertos = len(nao_faturados)
+    volume_total = sum(p['PESO_TOTAL'] for p in nao_faturados)
+
+    kpi1, kpi2 = st.columns(2)
+    kpi1.metric("Pedidos em Aberto", total_abertos)
+    kpi2.metric("Volume Total (Tons)", formatar_peso_brasileiro(volume_total))
+    st.divider()
+
+    col_busca, col_cliente = st.columns([2, 1])
+    with col_busca:
+        texto_busca = st.text_input("🔍 Filtro (Cliente, Pedido...):", key="mp_busca")
+    with col_cliente:
+        clientes_disponiveis = sorted(set(str(p['CLIENTE']).strip().title() for p in pedidos_final))
+        cliente_selecionado = st.selectbox("Filtrar por Cliente", ["Todos"] + clientes_disponiveis, key="mp_filtro_cliente")
+
+    pedidos_ordenados = sorted(pedidos_final, key=lambda x: x['STATUS_ORDEM'])
+    if texto_busca:
+        alvo_busca = texto_busca.lower()
+        pedidos_ordenados = [p for p in pedidos_ordenados if alvo_busca in f"{p['PEDIDO']} {p['CLIENTE']} {p['CLIENTE_ENTREGA']}".lower()]
+    if cliente_selecionado != "Todos":
+        pedidos_ordenados = [p for p in pedidos_ordenados if str(p['CLIENTE']).strip().title() == cliente_selecionado]
+
+    if 'mp_qtd_exibida' not in st.session_state:
+        st.session_state['mp_qtd_exibida'] = 25
+
+    total_filtrado = len(pedidos_ordenados)
+    qtd_exibida = min(st.session_state['mp_qtd_exibida'], total_filtrado)
+    st.caption(f"Mostrando {qtd_exibida} de {total_filtrado} pedido(s).")
+
+    for p in pedidos_ordenados[:qtd_exibida]:
+        with st.container(border=True):
+            st.markdown(f"**Pedido {p['PEDIDO']}** — {str(p['CLIENTE']).strip().title()}")
+            st.caption(f"Filial: {str(p['FILIAL']).strip().upper()}")
+
+            if p['TRIANGULAR']:
+                st.caption(f"🔀 Entrega em: {str(p['CLIENTE_ENTREGA']).strip().title()} — {str(p['MUNICIPIO_ENTREGA']).strip().title()}/{p['UF_ENTREGA']}")
+            else:
+                st.caption(f"📍 Destino: {str(p['MUNICIPIO_ENTREGA']).strip().title()}/{p['UF_ENTREGA']}")
+
+            if p['STATUS_TEXTO'] != "Faturado" and p['TEM_ITENS_FATURADOS']:
+                st.caption("✅ Parte deste pedido já foi faturada — veja o detalhe em 'Ver itens'.")
+
+            def _timeline_html(status_txt):
+                etapas_internas = ["Aberto", "Programado", "Pronto", "Faturado"]
+                labels = ["Não Programado", "Programado", "Pronto", "Faturado"]
+                icones = ["📝", "🛠️", "📦", "🚚"]
+                cores = ["#ef4444", "#f59e0b", "#22c55e", "#3b82f6"]
+                idx_atual = etapas_internas.index(status_txt)
+
+                partes = []
+                for i in range(4):
+                    if i < idx_atual:
+                        circulo = "<div style='width:20px; height:20px; border-radius:50%; background:#e5e7eb; display:flex; align-items:center; justify-content:center; font-size:11px; color:#6b7280; margin:0 auto'>✓</div>"
+                        texto = ""
+                    elif i == idx_atual:
+                        circulo = f"<div style='width:24px; height:24px; border-radius:50%; background:{cores[i]}; display:flex; align-items:center; justify-content:center; font-size:13px; margin:0 auto'>{icones[i]}</div>"
+                        texto = f"<div style='font-size:11px; color:{cores[i]}; font-weight:600; margin-top:3px; white-space:nowrap; text-align:center'>{labels[i]}</div>"
+                    else:
+                        circulo = "<div style='width:20px; height:20px; border-radius:50%; background:#f3f4f6; border:1px solid #e5e7eb; margin:0 auto'></div>"
+                        texto = ""
+
+                    alinhamento_bloco = "flex-start" if i == 0 else "center"
+                    partes.append(f"<div style='flex:1 1 0; min-width:0; display:flex; flex-direction:column; align-items:{alinhamento_bloco}'>{circulo}{texto}</div>")
+
+                    if i < 3:
+                        linha_cor = "#d1d5db" if i >= idx_atual else "#9ca3af"
+                        partes.append(f"<div style='flex:0 0 12px; height:2px; background:{linha_cor}; margin-top:10px'></div>")
+
+                return f"<div style='display:flex; align-items:flex-start; width:100%'>{''.join(partes)}</div>"
+
+            with st.expander("Ver itens"):
+                linhas_html = ""
+                for _, item in p['ITENS'].iterrows():
+                    data_ref_val = item['DATA_REF']
+                    if isinstance(data_ref_val, pd.Timestamp) and pd.notna(data_ref_val):
+                        data_ref_str = data_ref_val.strftime('%d/%m/%Y')
+                    elif isinstance(data_ref_val, str):
+                        data_ref_str = data_ref_val
+                    else:
+                        data_ref_str = '-'
+                    eta_val = item['PREVISAO_CHEGADA']
+                    if isinstance(eta_val, pd.Timestamp) and pd.notna(eta_val):
+                        eta_str = eta_val.strftime('%d/%m/%Y')
+                    elif isinstance(eta_val, str):
+                        eta_str = eta_val
+                    else:
+                        eta_str = '-'
+                    lote_str = str(item.get('LOTE', '') or '-')
+                    lote_mp_str = str(item.get('LOTE_MP', '') or '-')
+
+                    if item.get('INCONSISTENTE'):
+                        timeline_conteudo = "<div style='background:#fef3c7; color:#92400e; padding:4px 8px; border-radius:6px; font-size:11px; font-weight:600; white-space:nowrap'>⚠️ Sem Lote e Lote MP vinculados</div>"
+                    else:
+                        timeline_conteudo = _timeline_html(item['STATUS_ITEM'])
+
+                    celulas = [
+                        f"<td style='padding:6px; border-bottom:1px solid #e5e7eb'>{item['PRODUTO']}</td>",
+                        f"<td style='padding:6px; border-bottom:1px solid #e5e7eb; text-align:right'>{item['TONS']}</td>",
+                        f"<td style='padding:6px; border-bottom:1px solid #e5e7eb'>{lote_str}</td>",
+                        f"<td style='padding:6px; border-bottom:1px solid #e5e7eb'>{lote_mp_str}</td>",
+                        f"<td style='padding:6px; border-bottom:1px solid #e5e7eb; font-size:12px; white-space:nowrap'>{timeline_conteudo}</td>",
+                        f"<td style='padding:6px; border-bottom:1px solid #e5e7eb'>{data_ref_str}</td>",
+                        f"<td style='padding:6px; border-bottom:1px solid #e5e7eb'>{eta_str}</td>",
+                    ]
+                    linhas_html += "<tr>" + "".join(celulas) + "</tr>"
+
+                cabecalho = (
+                    "<tr style='color:#6b7280; text-align:left'>"
+                    "<th style='padding:6px'>Produto</th>"
+                    "<th style='padding:6px; text-align:right; width:60px'>Tons</th>"
+                    "<th style='padding:6px; width:95px'>Lote</th>"
+                    "<th style='padding:6px; width:95px'>Lote MP</th>"
+                    "<th style='padding:6px; width:200px'>Linha do tempo</th>"
+                    "<th style='padding:6px; width:170px'>Prev. Ficar Pronto</th>"
+                    "<th style='padding:6px; width:170px'>Previsão de Chegada</th>"
+                    "</tr>"
+                )
+                tabela_html = f"<table style='width:100%; border-collapse:collapse; table-layout:fixed; font-size:13px'>{cabecalho}{linhas_html}</table>"
+                st.markdown(tabela_html, unsafe_allow_html=True)
+
+    if qtd_exibida < total_filtrado:
+        if st.button("Carregar mais 25 pedidos", key="mp_carregar_mais"):
+            st.session_state['mp_qtd_exibida'] += 25
+            st.rerun()
 
 @st.dialog("🚀 Novidade no Painel Dox: Nova Aba 'Carteira'", width="large")
 def popup_aviso_carteira():
@@ -2065,8 +2582,9 @@ else:
         
         if st.session_state['usuario_tipo'].lower() == "admin":
             # Adicionei "📂 Carteira" no início (a0)
-            a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11 = st.tabs(["📂 Carteira", "📂 Itens Programados", "💰 Crédito", "📦 Estoque", "📷 Fotos RDQ", "📝 Acessos", "📑 Certificados", "🧾 Notas Fiscais", "🔍 Logs", "📊 Faturamento", "🏭 Produção", "🔧 Manutenção"])
+            aMP, a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11 = st.tabs(["🎯 Meus Pedidos", "📂 Carteira", "📂 Itens Programados", "💰 Crédito", "📦 Estoque", "📷 Fotos RDQ", "📝 Acessos", "📑 Certificados", "🧾 Notas Fiscais", "🔍 Logs", "📊 Faturamento", "🏭 Produção", "🔧 Manutenção"])
             
+            with aMP: exibir_meus_pedidos()
             with a0: exibir_aba_carteira_geral()
             with a1: exibir_carteira_pedidos()
             with a2: exibir_aba_credito()
@@ -2081,7 +2599,8 @@ else:
             with a11: exibir_aba_manutencao() 
             
         elif st.session_state['usuario_tipo'].lower() == "master":
-            a0, a1, a2, a3, a4, a5, a6, a7, a8 = st.tabs(["📂 Carteira", "📂 Itens Programados", "💰 Crédito", "📦 Estoque", "📷 Fotos RDQ", "📑 Certificados", "🧾 Notas Fiscais", "📊 Faturamento", "🏭 Produção"])
+            aMP, a0, a1, a2, a3, a4, a5, a6, a7, a8 = st.tabs(["🎯 Meus Pedidos", "📂 Carteira", "📂 Itens Programados", "💰 Crédito", "📦 Estoque", "📷 Fotos RDQ", "📑 Certificados", "🧾 Notas Fiscais", "📊 Faturamento", "🏭 Produção"])
+            with aMP: exibir_meus_pedidos()
             with a0: exibir_aba_carteira_geral()
             with a1: exibir_carteira_pedidos()
             with a2: exibir_aba_credito()
@@ -2093,7 +2612,8 @@ else:
             with a8: exibir_aba_producao()
 
         elif st.session_state['usuario_tipo'].lower() in ["logística", "logistica", "pcp"]:
-            a0, a1, a2, a3, a4, a5 = st.tabs(["📂 Carteira", "📂 Itens Programados", "📦 Estoque", "📷 Fotos RDQ", "📑 Certificados", "🧾 Notas Fiscais"])
+            aMP, a0, a1, a2, a3, a4, a5 = st.tabs(["🎯 Meus Pedidos", "📂 Carteira", "📂 Itens Programados", "📦 Estoque", "📷 Fotos RDQ", "📑 Certificados", "🧾 Notas Fiscais"])
+            with aMP: exibir_meus_pedidos()
             with a0: exibir_aba_carteira_geral()
             with a1: exibir_carteira_pedidos()
             with a2: exibir_aba_estoque()
@@ -2113,7 +2633,8 @@ else:
             
         else:
             # Vendedores e Gerentes Padrão
-            a0, a1, a2, a3, a4, a5, a6 = st.tabs(["📂 Carteira", "📂 Itens Programados", "💰 Crédito", "📦 Estoque", "📷 Fotos RDQ", "📑 Certificados", "🧾 Notas Fiscais"])
+            aMP, a0, a1, a2, a3, a4, a5, a6 = st.tabs(["🎯 Meus Pedidos", "📂 Carteira", "📂 Itens Programados", "💰 Crédito", "📦 Estoque", "📷 Fotos RDQ", "📑 Certificados", "🧾 Notas Fiscais"])
+            with aMP: exibir_meus_pedidos()
             with a0: exibir_aba_carteira_geral()
             with a1: exibir_carteira_pedidos()
             with a2: exibir_aba_credito()
